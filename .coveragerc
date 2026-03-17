@@ -1,0 +1,15 @@
+[run]
+source = .
+omit =
+    tests/*
+    app.py
+    */__pycache__/*
+    */site-packages/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    def main_loop
+    raise NotImplementedError
+show_missing = True

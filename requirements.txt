@@ -1,0 +1,5 @@
+akshare>=1.12.0
+streamlit>=1.35.0
+requests>=2.31.0
+chinese_calendar>=1.8.0
+pandas>=2.1.0

@@ -1,0 +1,40 @@
+{
+  "settings": {
+    "poll_interval_seconds": 30,
+    "web_server_url": "http://localhost:8501",
+    "bark_api_url": "https://api.day.app",
+    "bark_token": "YOUR_BARK_TOKEN_HERE",
+    "cash_reserve": 100000.0,
+    "lot_size_default": 500,
+    "grid_levels": 20,
+    "default_take_profit_pct": 0.07
+  },
+  "stocks": [
+    {
+      "code": "01336",
+      "name": "新华保险",
+      "exchange": "HK",
+      "akshare_code": "01336",
+      "base_price": 28.5,
+      "hist_min": 14.0,
+      "lot_size": 500,
+      "step": null,
+      "take_profit_pct": 0.07,
+      "enabled": true,
+      "annual_dividend_hkd": 1.8
+    },
+    {
+      "code": "00525",
+      "name": "广深铁路",
+      "exchange": "HK",
+      "akshare_code": "00525",
+      "base_price": 4.5,
+      "hist_min": 2.2,
+      "lot_size": 1000,
+      "step": null,
+      "take_profit_pct": 0.07,
+      "enabled": true,
+      "annual_dividend_hkd": 0.22
+    }
+  ]
+}
