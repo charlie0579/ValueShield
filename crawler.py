@@ -8,6 +8,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
+import re
+
+import requests
 import akshare as ak
 import pandas as pd
 
@@ -36,38 +39,74 @@ def _retry(func, *args, retries: int = MAX_RETRIES, delay: float = RETRY_DELAY_S
     ) from last_exception
 
 
+def _fetch_via_sina(akshare_code: str) -> float:
+    """
+    备用通道：新浪财经港股实时接口（港元计价，规避东方财富代理封锁）。
+    URL 格式: https://hq.sinajs.cn/list=rt_hk{5位代码}
+    返回字段: 名称,代码,现价,最高,最低,开盘,昨收,...
+    """
+    code_padded = akshare_code.zfill(5)
+    url = f"https://hq.sinajs.cn/list=rt_hk{code_padded}"
+    headers = {
+        "Referer": "https://finance.sina.com.cn",
+        "User-Agent": "Mozilla/5.0 (compatible)",
+    }
+    resp = requests.get(url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    match = re.search(r'"([^"]*)"', resp.text)
+    if not match:
+        raise ValueError(f"Sina 返回格式异常: {resp.text[:120]}")
+    fields = match.group(1).split(",")
+    if len(fields) < 3 or not fields[2].strip():
+        raise ValueError(f"Sina 字段不足或价格为空: {fields[:6]}")
+    price = float(fields[2].strip())
+    if price <= 0:
+        raise ValueError(f"Sina 返回价格无效（可能非交易时段）: {price}")
+    logger.info("[%s] Sina 备用通道获取价格成功: %.4f HKD", akshare_code, price)
+    return price
+
+
 def fetch_realtime_price(akshare_code: str) -> Optional[float]:
     """
-    获取港股实时最新价（收盘价或最新行情价）。
+    获取港股实时最新价（港元计价）。
+    先尝试东方财富 AkShare 接口，失败则自动切换至新浪财经备用通道。
     akshare_code: 如 '01336'、'00525'
-    返回 float 价格，失败返回 None。
     """
-    def _fetch():
+    def _fetch_akshare():
         symbol = akshare_code.lstrip("0") or "0"
-        logger.info("[%s] 正在调用 stock_hk_spot_em() 获取实时行情...", akshare_code)
+        logger.info("[%s] 正在调用 AkShare stock_hk_spot_em()...", akshare_code)
         df: pd.DataFrame = ak.stock_hk_spot_em()
         if df is None or df.empty:
             raise ValueError("stock_hk_spot_em 返回空数据")
-        logger.info("[%s] 接口返回 %d 条数据，列名: %s", akshare_code, len(df), df.columns.tolist())
+        logger.info("[%s] AkShare 返回 %d 条，列名: %s", akshare_code, len(df), df.columns.tolist())
         row = df[df["代码"] == akshare_code]
         if row.empty:
             row = df[df["代码"] == symbol]
         if row.empty:
-            all_codes = df["代码"].tolist()[:10]
+            sample = df["代码"].tolist()[:10]
             raise ValueError(
-                f"未找到股票代码 {akshare_code}（也尝试了 {symbol}），"
-                f"接口返回代码样本: {all_codes}"
+                f"未找到 {akshare_code}（也尝试了 {symbol}），样本: {sample}"
             )
         price = float(row.iloc[0]["最新价"])
-        logger.info("[%s] 获取到最新价: %.4f HKD", akshare_code, price)
+        logger.info("[%s] AkShare 获取价格: %.4f HKD", akshare_code, price)
         return price
 
+    # 主通道：东方财富 AkShare
     try:
-        return _retry(_fetch)
-    except Exception as exc:
+        return _retry(_fetch_akshare)
+    except Exception as ak_exc:
+        logger.warning(
+            "[%s] AkShare 主通道失败: %s，切换至新浪备用通道...",
+            akshare_code, ak_exc,
+        )
+
+    # 备用通道：新浪财经
+    try:
+        return _retry(_fetch_via_sina, akshare_code)
+    except Exception as sina_exc:
         logger.error(
-            "[%s] 获取实时价格失败（已重试 %d 次）: %s",
-            akshare_code, MAX_RETRIES, exc,
+            "[%s] 两个通道均失败 — AkShare: 见上方日志 | Sina: %s",
+            akshare_code, sina_exc,
         )
         return None
 
