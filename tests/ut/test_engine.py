@@ -363,3 +363,216 @@ class TestCurrentGridIndex:
         mid_price = prices[9] + 0.001
         idx = engine_1336.current_grid_index(mid_price)
         assert idx < 10  # 应在第9格以上
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6+ Holding.is_core 字段
+# ─────────────────────────────────────────────────────────────────────────────
+class TestHoldingIsCore:
+    """Holding.is_core 默认值、序列化与反序列化。"""
+
+    def test_is_core_defaults_to_false(self):
+        h = Holding(grid_level=0, buy_price=28.0, lot_size=500)
+        assert h.is_core is False
+
+    def test_is_core_serializes_to_dict(self):
+        h = Holding(grid_level=1, buy_price=27.0, lot_size=500, is_core=True)
+        d = h.to_dict()
+        assert d["is_core"] is True
+
+    def test_is_core_false_serializes_to_dict(self):
+        h = Holding(grid_level=2, buy_price=26.0, lot_size=500, is_core=False)
+        d = h.to_dict()
+        assert d["is_core"] is False
+
+    def test_is_core_restores_from_dict(self):
+        original = Holding(grid_level=3, buy_price=25.0, lot_size=500, is_core=True)
+        restored = Holding.from_dict(original.to_dict())
+        assert restored.is_core is True
+
+    def test_is_core_false_restores_from_dict(self):
+        original = Holding(grid_level=4, buy_price=24.0, lot_size=500, is_core=False)
+        restored = Holding.from_dict(original.to_dict())
+        assert restored.is_core is False
+
+    def test_from_dict_missing_is_core_defaults_to_false(self):
+        """旧版 state.json 中没有 is_core 字段时，应向后兼容默认为 False。"""
+        data = {"holding_id": "x", "grid_level": 0, "buy_price": 28.0, "lot_size": 500,
+                "buy_time": "", "take_profit_pct": 0.07, "custom_take_profit_pct": None,
+                "sold": False, "sell_price": None, "sell_time": None}
+        h = Holding.from_dict(data)
+        assert h.is_core is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6+ toggle_core 方法
+# ─────────────────────────────────────────────────────────────────────────────
+class TestToggleCore:
+    """GridEngine.toggle_core 切换底仓标记。"""
+
+    def test_toggle_core_on(self, engine_1336: GridEngine):
+        holding = engine_1336.confirm_buy(0)
+        result = engine_1336.toggle_core(holding.holding_id)
+        assert result is True
+        assert holding.is_core is True
+
+    def test_toggle_core_off_again(self, engine_1336: GridEngine):
+        holding = engine_1336.confirm_buy(1)
+        engine_1336.toggle_core(holding.holding_id)
+        engine_1336.toggle_core(holding.holding_id)
+        assert holding.is_core is False
+
+    def test_toggle_core_unknown_id_returns_false(self, engine_1336: GridEngine):
+        result = engine_1336.toggle_core("nonexistent-id")
+        assert result is False
+
+    def test_toggle_core_does_not_affect_other_holdings(self, engine_1336: GridEngine):
+        h0 = engine_1336.confirm_buy(0)
+        h1 = engine_1336.confirm_buy(2)
+        engine_1336.toggle_core(h0.holding_id)
+        assert h0.is_core is True
+        assert h1.is_core is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6+ confirm_buy(actual_price) 实际成交价覆盖
+# ─────────────────────────────────────────────────────────────────────────────
+class TestConfirmBuyActualPrice:
+    """confirm_buy 的 actual_price 参数覆盖网格触发价。"""
+
+    def test_actual_price_overrides_grid_price(self, engine_1336: GridEngine):
+        holding = engine_1336.confirm_buy(3, actual_price=26.88)
+        assert holding.buy_price == pytest.approx(26.88)
+
+    def test_actual_price_none_uses_grid_price(self, engine_1336: GridEngine):
+        grid_price = engine_1336.grid_prices()[3]
+        holding = engine_1336.confirm_buy(3, actual_price=None)
+        assert holding.buy_price == pytest.approx(grid_price)
+
+    def test_actual_price_affects_take_profit(self, engine_1336: GridEngine):
+        """actual_price 覆盖后，止盈价应基于实际成交价计算。"""
+        holding = engine_1336.confirm_buy(2, actual_price=30.0)
+        expected_tp = round(30.0 * 1.07, 4)
+        assert holding.take_profit_price == pytest.approx(expected_tp)
+
+    def test_actual_price_lower_than_grid_price(self, engine_1336: GridEngine):
+        """实际成交价可以低于网格触发价（滑点优势）。"""
+        grid_price = engine_1336.grid_prices()[0]
+        holding = engine_1336.confirm_buy(0, actual_price=grid_price - 0.5)
+        assert holding.buy_price < grid_price
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6+ check_sell_signals(min_holding_limit) 底仓保护
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSellSignalMinHolding:
+    """min_holding_limit 参数：总持股 ≤ 阈值时屏蔽全部卖出信号。"""
+
+    def test_no_sell_when_shares_below_threshold(self, engine_1336: GridEngine):
+        holding = engine_1336.confirm_buy(0)
+        tp_price = holding.take_profit_price + 0.01
+        # lot_size=500, min_holding_limit=500 → 正好等于阈值，应屏蔽
+        result = engine_1336.check_sell_signals(tp_price, min_holding_limit=500)
+        assert result == []
+
+    def test_no_sell_when_shares_strictly_below_threshold(self, engine_1336: GridEngine):
+        holding = engine_1336.confirm_buy(0)
+        tp_price = holding.take_profit_price + 0.01
+        # 持股 500，阈值 1000 → 屏蔽
+        result = engine_1336.check_sell_signals(tp_price, min_holding_limit=1000)
+        assert result == []
+
+    def test_sell_allowed_when_shares_above_threshold(self, engine_1336: GridEngine):
+        h0 = engine_1336.confirm_buy(0)
+        h1 = engine_1336.confirm_buy(2)
+        tp_price = max(h0.take_profit_price, h1.take_profit_price) + 0.01
+        # 持股 1000（2×500），阈值 500 → 允许卖出
+        result = engine_1336.check_sell_signals(tp_price, min_holding_limit=500)
+        assert len(result) >= 1
+
+    def test_zero_threshold_does_not_protect(self, engine_1336: GridEngine):
+        """阈值为 0 时不激活底仓保护，正常触发卖出。"""
+        holding = engine_1336.confirm_buy(1)
+        tp_price = holding.take_profit_price + 0.01
+        result = engine_1336.check_sell_signals(tp_price, min_holding_limit=0)
+        assert holding in result
+
+    def test_is_core_holding_excluded_from_sell(self, engine_1336: GridEngine):
+        """is_core=True 的底仓不应出现在卖出信号中。"""
+        holding = engine_1336.confirm_buy(0)
+        holding.is_core = True
+        tp_price = holding.take_profit_price + 0.01
+        result = engine_1336.check_sell_signals(tp_price, min_holding_limit=0)
+        assert holding not in result
+
+    def test_is_core_excluded_even_with_sufficient_shares(self, engine_1336: GridEngine):
+        """即使总持股超过阈值，is_core=True 的持仓也不触发卖出。"""
+        h0 = engine_1336.confirm_buy(0)
+        h0.is_core = True
+        h1 = engine_1336.confirm_buy(2)
+        tp_price = max(h0.take_profit_price, h1.take_profit_price) + 0.01
+        result = engine_1336.check_sell_signals(tp_price, min_holding_limit=0)
+        assert h0 not in result
+        assert h1 in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.6+ 资产统计方法
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPortfolioStats:
+    """total_market_value / core_position_value / realized_profit。"""
+
+    def test_total_market_value_no_holdings(self, engine_1336: GridEngine):
+        assert engine_1336.total_market_value(28.0) == pytest.approx(0.0)
+
+    def test_total_market_value_single_holding(self, engine_1336: GridEngine):
+        engine_1336.confirm_buy(0)
+        # lot_size=500, price=30.0 → 15000
+        assert engine_1336.total_market_value(30.0) == pytest.approx(15000.0)
+
+    def test_total_market_value_multiple_holdings(self, engine_1336: GridEngine):
+        engine_1336.confirm_buy(0)
+        engine_1336.confirm_buy(2)
+        # 2×500×25.0 = 25000
+        assert engine_1336.total_market_value(25.0) == pytest.approx(25000.0)
+
+    def test_total_market_value_excludes_sold(self, engine_1336: GridEngine):
+        h = engine_1336.confirm_buy(0)
+        engine_1336.confirm_buy(1)
+        engine_1336.confirm_sell(h.holding_id, 30.0)
+        # 只剩 1 手活跃，500×20 = 10000
+        assert engine_1336.total_market_value(20.0) == pytest.approx(10000.0)
+
+    def test_core_position_value_only_is_core(self, engine_1336: GridEngine):
+        h0 = engine_1336.confirm_buy(0)
+        h0.is_core = True
+        engine_1336.confirm_buy(2)  # 非底仓
+        price = 28.0
+        # 只有 h0 算底仓市值：500×28 = 14000
+        assert engine_1336.core_position_value(price) == pytest.approx(14000.0)
+
+    def test_core_position_value_zero_when_no_core(self, engine_1336: GridEngine):
+        engine_1336.confirm_buy(0)
+        engine_1336.confirm_buy(2)
+        assert engine_1336.core_position_value(28.0) == pytest.approx(0.0)
+
+    def test_realized_profit_zero_when_no_sells(self, engine_1336: GridEngine):
+        engine_1336.confirm_buy(0)
+        assert engine_1336.realized_profit() == pytest.approx(0.0)
+
+    def test_realized_profit_single_sell(self, engine_1336: GridEngine):
+        h = engine_1336.confirm_buy(0, actual_price=25.0)
+        engine_1336.confirm_sell(h.holding_id, 27.0)
+        # (27.0-25.0)*500 = 1000
+        assert engine_1336.realized_profit() == pytest.approx(1000.0)
+
+    def test_realized_profit_multiple_sells(self, engine_1336: GridEngine):
+        h0 = engine_1336.confirm_buy(0, actual_price=25.0)
+        h1 = engine_1336.confirm_buy(2, actual_price=24.0)
+        engine_1336.confirm_sell(h0.holding_id, 27.0)  # 2*500=1000
+        engine_1336.confirm_sell(h1.holding_id, 26.0)  # 2*500=1000
+        assert engine_1336.realized_profit() == pytest.approx(2000.0)
+
+    def test_realized_profit_does_not_count_active_holdings(self, engine_1336: GridEngine):
+        engine_1336.confirm_buy(0, actual_price=25.0)  # 未卖出，不计入
+        assert engine_1336.realized_profit() == pytest.approx(0.0)

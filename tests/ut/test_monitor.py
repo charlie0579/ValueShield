@@ -225,3 +225,124 @@ class TestRunOnce:
                 with patch("monitor.compute_dividend_yield", return_value=0.065):
                     updated = run_once(sample_config, sample_state, engines, notifier)
         assert updated["last_updated"] != ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.7+ _add_pending 去重逻辑
+# ─────────────────────────────────────────────────────────────────────────────
+class TestAddPending:
+    """_add_pending 内部函数：同 code+type+grid_level+holding_id 去重。"""
+
+    def test_add_pending_first_entry_appended(self):
+        state = {}
+        entry = {"code": "01336", "type": "buy", "grid_level": 0, "holding_id": "h1"}
+        monitor._add_pending(state, entry)
+        assert len(state["pending_confirmations"]) == 1
+
+    def test_add_pending_duplicate_updates_existing(self):
+        state = {}
+        e1 = {"code": "01336", "type": "buy", "grid_level": 0, "holding_id": "h1", "price": 27.0}
+        e2 = {"code": "01336", "type": "buy", "grid_level": 0, "holding_id": "h1", "price": 26.5}
+        monitor._add_pending(state, e1)
+        monitor._add_pending(state, e2)
+        # 去重：列表长度仍为 1，但 price 被更新
+        assert len(state["pending_confirmations"]) == 1
+        assert state["pending_confirmations"][0]["price"] == 26.5
+
+    def test_add_pending_different_level_not_deduped(self):
+        state = {}
+        e1 = {"code": "01336", "type": "buy", "grid_level": 0, "holding_id": "h1"}
+        e2 = {"code": "01336", "type": "buy", "grid_level": 1, "holding_id": "h2"}
+        monitor._add_pending(state, e1)
+        monitor._add_pending(state, e2)
+        assert len(state["pending_confirmations"]) == 2
+
+    def test_add_pending_different_type_not_deduped(self):
+        state = {}
+        e1 = {"code": "01336", "type": "buy",  "grid_level": 0, "holding_id": "h1"}
+        e2 = {"code": "01336", "type": "sell", "grid_level": 0, "holding_id": "h1"}
+        monitor._add_pending(state, e1)
+        monitor._add_pending(state, e2)
+        assert len(state["pending_confirmations"]) == 2
+
+    def test_add_pending_different_code_not_deduped(self):
+        state = {}
+        e1 = {"code": "01336", "type": "buy", "grid_level": 0, "holding_id": "h1"}
+        e2 = {"code": "00525", "type": "buy", "grid_level": 0, "holding_id": "h2"}
+        monitor._add_pending(state, e1)
+        monitor._add_pending(state, e2)
+        assert len(state["pending_confirmations"]) == 2
+
+    def test_add_pending_initializes_list_if_missing(self):
+        state = {}
+        monitor._add_pending(state, {"code": "x", "type": "buy", "grid_level": 0})
+        assert "pending_confirmations" in state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v1.8+ min_holding_limit 透传到 check_sell_signals
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRunOnceMinHolding:
+    """run_once 将 settings.min_holding_limit 透传给 check_sell_signals。"""
+
+    def test_min_holding_suppresses_sell_signal(self, sample_config, sample_state):
+        """设置阈值后，即使价格超过止盈价也不产生卖出通知。"""
+        sample_config["settings"]["min_holding_limit"] = 500  # 阈值=1手
+        engines = build_engines(sample_config, sample_state)
+        notifier_mock = MagicMock()
+        notifier_mock.notify_buy.return_value = True
+        notifier_mock.notify_sell.return_value = True
+        notifier_mock.notify_risk_warning.return_value = True
+
+        target = engines["01336"]
+        holding = target.confirm_buy(0)
+        tp_price = holding.take_profit_price + 0.01  # 超过止盈价
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    run_once(sample_config, sample_state, engines, notifier_mock)
+
+        # 只有 500 股（=阈值），卖出信号被屏蔽
+        notifier_mock.notify_sell.assert_not_called()
+
+    def test_min_holding_zero_allows_sell_signal(self, sample_config, sample_state):
+        """阈值为 0 时，正常触发卖出通知。"""
+        sample_config["settings"]["min_holding_limit"] = 0
+        engines = build_engines(sample_config, sample_state)
+        notifier_mock = MagicMock()
+        notifier_mock.notify_buy.return_value = True
+        notifier_mock.notify_sell.return_value = True
+        notifier_mock.notify_risk_warning.return_value = True
+
+        target = engines["01336"]
+        holding = target.confirm_buy(0)
+        tp_price = holding.take_profit_price + 0.01
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    run_once(sample_config, sample_state, engines, notifier_mock)
+
+        notifier_mock.notify_sell.assert_called()
+
+    def test_min_holding_limit_default_zero_when_missing(self, sample_config, sample_state):
+        """settings 中没有 min_holding_limit 时默认为 0，不影响正常卖出。"""
+        # 确保 settings 中没有该键
+        sample_config["settings"].pop("min_holding_limit", None)
+        engines = build_engines(sample_config, sample_state)
+        notifier_mock = MagicMock()
+        notifier_mock.notify_buy.return_value = True
+        notifier_mock.notify_sell.return_value = True
+        notifier_mock.notify_risk_warning.return_value = True
+
+        target = engines["01336"]
+        holding = target.confirm_buy(0)
+        tp_price = holding.take_profit_price + 0.01
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    run_once(sample_config, sample_state, engines, notifier_mock)
+
+        notifier_mock.notify_sell.assert_called()

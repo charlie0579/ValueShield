@@ -358,3 +358,224 @@ class TestSCT07_MultiStockMonitoring:
         # 两只股票风险资金独立计算
         total = compute_total_risk_capital(engines)
         assert total == pytest.approx(risk_1336 + risk_0525, rel=1e-6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCT-08: 底仓保护端到端场景（is_core + check_sell_signals）
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSCT08_CorePositionProtection:
+    """
+    场景：持仓被标记为底仓（is_core=True）后，即使价格超过止盈价也不触发卖出。
+    """
+
+    def test_core_holding_does_not_trigger_sell_notification(
+        self, sample_config, sample_state
+    ):
+        """底仓标记后，run_once 不应发送止盈通知。"""
+        engines = build_engines(sample_config, sample_state)
+        notifier = make_notifier()
+
+        target = engines["01336"]
+        holding = target.confirm_buy(0)
+        holding.is_core = True  # 标记底仓
+        tp_price = holding.take_profit_price + 0.01  # 超过止盈价
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    run_once(sample_config, sample_state, engines, notifier)
+
+        notifier.notify_sell.assert_not_called()
+
+    def test_non_core_holding_still_triggers_sell(self, sample_config, sample_state):
+        """同时有底仓和非底仓时，只有非底仓触发止盈。"""
+        engines = build_engines(sample_config, sample_state)
+        notifier = make_notifier()
+
+        target = engines["01336"]
+        h_core = target.confirm_buy(0)
+        h_core.is_core = True
+        h_normal = target.confirm_buy(2)
+        tp_price = max(h_core.take_profit_price, h_normal.take_profit_price) + 0.01
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    run_once(sample_config, sample_state, engines, notifier)
+
+        notifier.notify_sell.assert_called()
+
+    def test_toggle_core_and_verify_sell_suppression(self, engine_1336: GridEngine):
+        """toggle_core 切换后直接验证 check_sell_signals 行为。"""
+        holding = engine_1336.confirm_buy(1)
+        tp_price = holding.take_profit_price + 0.01
+
+        # 初始非底仓：应触发
+        assert engine_1336.check_sell_signals(tp_price) != []
+
+        # 标记为底仓：不触发
+        engine_1336.toggle_core(holding.holding_id)
+        assert engine_1336.check_sell_signals(tp_price) == []
+
+        # 再次切换回非底仓：恢复触发
+        engine_1336.toggle_core(holding.holding_id)
+        assert engine_1336.check_sell_signals(tp_price) != []
+
+    def test_core_holding_persists_after_state_roundtrip(
+        self, sample_config, sample_state, tmp_path
+    ):
+        """底仓标记在 state.json 序列化/反序列化后应完整保留。"""
+        engines = build_engines(sample_config, sample_state)
+        target = engines["01336"]
+        holding = target.confirm_buy(2)
+        target.toggle_core(holding.holding_id)
+        assert holding.is_core is True
+
+        state = sample_state.copy()
+        state["positions"]["01336"] = target.to_state_dict()
+        state_path = str(tmp_path / "state.json")
+        with patch.object(monitor, "STATE_PATH", state_path):
+            save_state(state)
+            restored = load_state()
+
+        engines2 = build_engines(sample_config, restored)
+        active = engines2["01336"].active_holdings()
+        assert len(active) == 1
+        assert active[0].is_core is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCT-09: actual_price 覆盖成交价端到端场景
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSCT09_ActualPriceOverride:
+    """
+    场景：confirm_buy 时传入 actual_price（不同于网格触发价），
+    验证止盈价基于实际成交价计算，且状态可正确序列化恢复。
+    """
+
+    def test_actual_price_sets_correct_buy_price(self, engine_1336: GridEngine):
+        actual = 26.33
+        holding = engine_1336.confirm_buy(3, actual_price=actual)
+        assert holding.buy_price == pytest.approx(actual)
+
+    def test_actual_price_take_profit_computed_from_actual(
+        self, engine_1336: GridEngine
+    ):
+        actual = 26.33
+        holding = engine_1336.confirm_buy(3, actual_price=actual)
+        expected_tp = round(actual * 1.07, 4)
+        assert holding.take_profit_price == pytest.approx(expected_tp)
+
+    def test_actual_price_persists_through_state_roundtrip(
+        self, sample_config, sample_state, tmp_path
+    ):
+        """实际成交价经 state.json 序列化后应完整保留。"""
+        engines = build_engines(sample_config, sample_state)
+        target = engines["01336"]
+        actual = 27.88
+        holding = target.confirm_buy(1, actual_price=actual)
+
+        state = sample_state.copy()
+        state["positions"]["01336"] = target.to_state_dict()
+        state_path = str(tmp_path / "state.json")
+        with patch.object(monitor, "STATE_PATH", state_path):
+            save_state(state)
+            restored = load_state()
+
+        engines2 = build_engines(sample_config, restored)
+        active = engines2["01336"].active_holdings()
+        assert len(active) == 1
+        assert active[0].buy_price == pytest.approx(actual)
+
+    def test_actual_price_higher_than_grid_triggers_higher_take_profit(
+        self, engine_1336: GridEngine
+    ):
+        """actual_price 高于网格触发价时，止盈价应相应更高。"""
+        grid_price = engine_1336.grid_prices()[0]
+        actual = grid_price + 0.5  # 实际成交价更高（滑点不利）
+        holding_actual = engine_1336.confirm_buy(0, actual_price=actual)
+        engine_0 = GridEngine(
+            code="01336", name="新华保险", base_price=28.5,
+            hist_min=14.0, lot_size=500, grid_levels=20
+        )
+        holding_grid = engine_0.confirm_buy(0)
+        assert holding_actual.take_profit_price > holding_grid.take_profit_price
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCT-10: min_holding_limit 端到端场景
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSCT10_MinHoldingLimitE2E:
+    """
+    场景：设置 min_holding_limit → 触发卖出信号 → 验证 pending_confirmations 不含卖出。
+    """
+
+    def test_sell_signal_not_added_to_pending_when_below_threshold(
+        self, sample_config, sample_state
+    ):
+        """阈值保护下，pending_confirmations 中不应有 sell 类型记录。"""
+        sample_config["settings"]["min_holding_limit"] = 1000  # 阈值 2 手
+        engines = build_engines(sample_config, sample_state)
+        notifier = make_notifier()
+
+        target = engines["01336"]
+        holding = target.confirm_buy(0)  # 买入 1 手（500 股）
+        tp_price = holding.take_profit_price + 0.01
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    updated = run_once(sample_config, sample_state, engines, notifier)
+
+        sell_pendings = [
+            p for p in updated.get("pending_confirmations", [])
+            if p.get("type") == "sell"
+        ]
+        assert sell_pendings == []
+
+    def test_sell_signal_added_when_above_threshold(
+        self, sample_config, sample_state
+    ):
+        """持股超过阈值时，卖出信号应正常进入 pending_confirmations。"""
+        sample_config["settings"]["min_holding_limit"] = 500  # 阈值 1 手
+        engines = build_engines(sample_config, sample_state)
+        notifier = make_notifier()
+
+        target = engines["01336"]
+        h0 = target.confirm_buy(0)
+        h1 = target.confirm_buy(2)  # 共 2 手 = 1000 股 > 阈值 500
+        tp_price = max(h0.take_profit_price, h1.take_profit_price) + 0.01
+
+        with patch("monitor.fetch_realtime_price", return_value=tp_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    updated = run_once(sample_config, sample_state, engines, notifier)
+
+        sell_pendings = [
+            p for p in updated.get("pending_confirmations", [])
+            if p.get("type") == "sell"
+        ]
+        assert len(sell_pendings) >= 1
+
+    def test_portfolio_stats_after_complete_workflow(
+        self, sample_config, sample_state
+    ):
+        """完整工作流：买入→标记底仓→再买→卖出→验证资产统计。"""
+        engines = build_engines(sample_config, sample_state)
+        target = engines["01336"]
+
+        h0 = target.confirm_buy(0, actual_price=25.0)  # 底仓
+        target.toggle_core(h0.holding_id)
+        h1 = target.confirm_buy(2, actual_price=24.0)  # 普通仓
+
+        price = 26.0
+        assert target.total_market_value(price) == pytest.approx(2 * 500 * 26.0)
+        assert target.core_position_value(price) == pytest.approx(500 * 26.0)
+        assert target.realized_profit() == pytest.approx(0.0)
+
+        # 卖出普通仓
+        target.confirm_sell(h1.holding_id, 26.5)
+        assert target.realized_profit() == pytest.approx((26.5 - 24.0) * 500)
+        # 底仓仍在
+        assert h0 in target.active_holdings()
+        assert h1 not in target.active_holdings()

@@ -64,7 +64,8 @@ class TestFetchRealtimePrice:
 
     def test_returns_none_on_network_failure(self):
         with patch("akshare.stock_hk_spot_em", side_effect=Exception("timeout")):
-            result = fetch_realtime_price("01336")
+            with patch("requests.get", side_effect=ConnectionError("sina also down")):
+                result = fetch_realtime_price("01336")
         assert result is None
 
     def test_returns_none_when_code_not_found(self):

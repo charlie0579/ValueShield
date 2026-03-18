@@ -78,7 +78,7 @@ class TestBarkNotifierSend:
 # notify_buy
 # ─────────────────────────────────────────────────────────────────────────────
 class TestNotifyBuy:
-    def test_title_contains_buy_keyword(self, notifier: BarkNotifier):
+    def test_title_contains_stock_name  (self, notifier: BarkNotifier):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         with patch("requests.post", return_value=mock_resp) as mock_post:
@@ -88,11 +88,11 @@ class TestNotifyBuy:
                 grid_level=2, grid_price=27.05,
             )
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert "买入" in payload["title"]
-        assert "01336" in payload["title"]
+        assert "[操作建议]" in payload["title"]
         assert "新华保险" in payload["title"]
+        assert "买入" in payload["body"]
 
-    def test_body_contains_price_and_yield(self, notifier: BarkNotifier):
+    def test_body_contains_grid_price       (self, notifier: BarkNotifier):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         with patch("requests.post", return_value=mock_resp) as mock_post:
@@ -102,10 +102,11 @@ class TestNotifyBuy:
                 grid_level=2, grid_price=27.05,
             )
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert "27.5" in payload["body"]
-        assert "6.50%" in payload["body"]
+        assert "买入" in payload["body"]
+        assert "27.050" in payload["body"]
+        assert "HKD" in payload["body"]
 
-    def test_body_shows_correct_grid_level(self, notifier: BarkNotifier):
+    def test_body_uses_grid_price_not_current(self, notifier: BarkNotifier):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         with patch("requests.post", return_value=mock_resp) as mock_post:
@@ -115,7 +116,8 @@ class TestNotifyBuy:
                 grid_level=4, grid_price=25.0,
             )
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert "第 5 格" in payload["body"]  # grid_level=4 → 显示为第 5 格
+        assert "25.000" in payload["body"]
+        assert "27.5" not in payload["body"]  # 当前价不在 body 中
 
     def test_callback_url_contains_code_and_level(self, notifier: BarkNotifier):
         mock_resp = MagicMock()
@@ -138,7 +140,7 @@ class TestNotifyBuy:
 # notify_sell
 # ─────────────────────────────────────────────────────────────────────────────
 class TestNotifySell:
-    def test_title_contains_sell_keyword(self, notifier: BarkNotifier):
+    def test_title_sell_contains_stock_name  (self, notifier: BarkNotifier):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         with patch("requests.post", return_value=mock_resp) as mock_post:
@@ -149,9 +151,11 @@ class TestNotifySell:
                 profit_pct=0.0909,
             )
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert "止盈" in payload["title"]
+        assert "[操作建议]" in payload["title"]
+        assert "新华保险" in payload["title"]
+        assert "止盈" in payload["body"]
 
-    def test_body_contains_profit_pct(self, notifier: BarkNotifier):
+    def test_body_sell_contains_current_price(self, notifier: BarkNotifier):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
         with patch("requests.post", return_value=mock_resp) as mock_post:
@@ -162,7 +166,9 @@ class TestNotifySell:
                 profit_pct=0.09,
             )
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
-        assert "9.00%" in payload["body"]
+        assert "止盈" in payload["body"]
+        assert "30.000" in payload["body"]
+        assert "HKD" in payload["body"]
 
     def test_callback_url_contains_confirm_sell(self, notifier: BarkNotifier):
         mock_resp = MagicMock()
