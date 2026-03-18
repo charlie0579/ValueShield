@@ -1,6 +1,6 @@
 """
-app.py - ValueShield v1.4
-亮色主题 · Apple/SaaS 卡片 · 标签页布局 · 条件通知栏 · 薄荷绿网格
+app.py - ValueShield v1.5
+亮色主题 · 缓存行情 · Toast反馈 · 配置页市价参考 · 字体可读性优化
 """
 
 import json
@@ -116,6 +116,12 @@ st.markdown(LIGHT_CSS, unsafe_allow_html=True)
 def save_config(cfg: dict) -> None:
     with open(CONFIG_PATH, "w", encoding="utf-8") as fp:
         json.dump(cfg, fp, ensure_ascii=False, indent=2)
+
+
+@st.cache_data(ttl=5)
+def _fetch_price_cached(akshare_code: str) -> float | None:
+    """带 5 s 缓存的行情拉取，防止高频点击阻塞 UI 渲染。"""
+    return fetch_realtime_price(akshare_code)
 
 
 def _hr() -> None:
@@ -467,8 +473,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         with hdr5:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("📡 刷新", key=f"fetch_{code}"):
-                with st.spinner("获取行情（双通道）..."):
-                    new_price = fetch_realtime_price(stock_cfg["akshare_code"])
+                _fetch_price_cached.clear()
+                with st.spinner("数据同步中..."):
+                    new_price = _fetch_price_cached(stock_cfg["akshare_code"])
                 if new_price:
                     state.setdefault("latest_prices", {})[code] = new_price
                     save_state(state)
@@ -479,7 +486,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
         _hr()
 
-        st.markdown('<div style="font-size:0.74rem;font-weight:600;color:#6B7280;margin-bottom:8px;">📊 网格热力图</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:0.74rem;font-weight:600;color:#374151;margin-bottom:8px;">📊 网格热力图</div>', unsafe_allow_html=True)
         render_grid_heatmap(engine, current_price or 0)
 
         _hr()
@@ -487,7 +494,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         active = engine.active_holdings()
         if active:
             st.markdown(
-                f'<div style="font-size:0.74rem;font-weight:600;color:#6B7280;margin-bottom:10px;">📋 当前持仓 ({len(active)} 笔)</div>',
+                f'<div style="font-size:0.74rem;font-weight:600;color:#374151;margin-bottom:10px;">📋 当前持仓 ({len(active)} 笔)</div>',
                 unsafe_allow_html=True,
             )
             for holding in active:
@@ -541,14 +548,30 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # ⚙️ 配置页
     # ════════════════════════════════════════════════════════════════
     with tab_config:
+        # ── 标题行：显示 Base/Step + 实时市价参考
+        mkt_ref = (
+            f"市场现价 <b style='color:#2563EB'>{current_price:.3f}</b> HKD · "
+            if current_price else ""
+        )
         st.markdown(
-            f'<div style="font-size:0.85rem;color:#6B7280;margin-bottom:16px;">'
-            f'<b style="color:#111827">{name}</b> ({code}.HK)'
-            f' · Base: <b>{engine.base_price:.4f}</b> · Step: <b>{engine.step:.4f}</b></div>',
+            f'<div style="font-size:0.85rem;color:#374151;margin-bottom:16px;">'
+            f'<b style="color:#111827">{name}</b> ({code}.HK) · '
+            f'{mkt_ref}Base: <b>{engine.base_price:.4f}</b> · Step: <b>{engine.step:.4f}</b></div>',
             unsafe_allow_html=True,
         )
 
         st.markdown("**📐 网格参数**")
+
+        # ── 同步现价为 Base 快捷按钮
+        if current_price:
+            if st.button(
+                f"📌 同步现价 {current_price:.3f} → Base",
+                key=f"sync_base_{code}",
+                help="将当前市场价填入 Base_Price 输入框，方便快速重置 20 个格子",
+            ):
+                st.session_state[f"base_{code}"] = float(current_price)
+                st.rerun()
+
         op1, op2, op3 = st.columns([2, 2, 1])
         with op1:
             new_base = st.number_input(
@@ -573,7 +596,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 save_config(config)
                 state["positions"][code] = engine.to_state_dict()
                 save_state(state)
-                st.success(f"已更新 Base={new_base:.4f}  Step={engine.step:.4f}")
+                st.toast(f"✅ Base={new_base:.4f}  Step={engine.step:.4f} 已应用")
                 st.rerun()
 
         _hr()
@@ -641,12 +664,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 "poll_interval_seconds": new_poll, "web_server_url": new_url,
             })
             save_config(config)
-            st.success("✅ 设置已保存！")
+            st.toast("✅ 设置已保存，重启生效")
             st.rerun()
 
     st.markdown(
         '<div style="text-align:center;color:#E5E7EB;font-size:0.6rem;padding:20px 0 6px;">'
-        'ValueShield v1.4 · 算法为辅，主观为主</div>',
+        'ValueShield v1.5 · 算法为辅，主观为主</div>',
         unsafe_allow_html=True,
     )
 
