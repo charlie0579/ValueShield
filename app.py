@@ -1,6 +1,6 @@
 """
-app.py - ValueShield v1.5
-亮色主题 · 缓存行情 · Toast反馈 · 配置页市价参考 · 字体可读性优化
+app.py - ValueShield v1.6
+底仓逻辑 · 资产总账 · 成交价覆盖 · 资金进度条 · 系统参数追加
 """
 
 import json
@@ -128,8 +128,21 @@ def _hr() -> None:
     st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 侧边栏导航
+def compute_portfolio_stats(engines: dict, state: dict) -> dict:
+    """计算全局资产总账：总市値 / 底仓规模 / 累计收割。"""
+    total_mv = 0.0
+    core_mv = 0.0
+    realized = 0.0
+    for code, engine in engines.items():
+        price = state.get("latest_prices", {}).get(code, 0.0) or 0.0
+        total_mv += engine.total_market_value(price)
+        core_mv += engine.core_position_value(price)
+        realized += engine.realized_profit()
+    return {
+        "total_market_value": round(total_mv, 2),
+        "core_value": round(core_mv, 2),
+        "realized_profit": round(realized, 2),
+    }
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_sidebar(config: dict, state: dict) -> str:
@@ -188,6 +201,7 @@ def render_sidebar(config: dict, state: dict) -> str:
 
 def render_grid_heatmap(engine: GridEngine, current_price: float) -> None:
     prices = engine.grid_prices()
+    core_levels = {h.grid_level for h in engine.active_holdings() if h.is_core}
 
     for row_start in range(0, len(prices), 10):
         cols = st.columns(10)
@@ -197,9 +211,14 @@ def render_grid_heatmap(engine: GridEngine, current_price: float) -> None:
                 break
             price = prices[i]
             is_occupied = str(i) in engine.grid_occupied
+            is_core_cell = i in core_levels
             is_current = current_price > 0 and abs(current_price - price) <= engine.step * 0.6
 
-            if is_occupied and is_current:
+            if is_core_cell and is_current:
+                bg = "#00897B"; bdr = "2px solid #004D40"; text = "#FFFFFF"; icon = "🏠"
+            elif is_core_cell:
+                bg = "#26A69A"; bdr = "1px solid #00897B"; text = "#FFFFFF"; icon = "🏠"
+            elif is_occupied and is_current:
                 bg = "#D1FAE5"; bdr = "2px solid #059669"; text = "#065F46"; icon = "📍"
             elif is_occupied:
                 bg = "#DCFCE7"; bdr = "1px solid #86EFAC"; text = "#15803D"; icon = "●"
@@ -220,6 +239,8 @@ def render_grid_heatmap(engine: GridEngine, current_price: float) -> None:
 
     st.markdown(
         '<div style="display:flex;gap:14px;margin-top:6px;font-size:0.67rem;color:#9CA3AF;">'
+        '<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
+        'background:#26A69A;border:1px solid #00897B;margin-right:3px;vertical-align:middle"></span>🏠底仓</span>'
         '<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
         'background:#DCFCE7;border:1px solid #86EFAC;margin-right:3px;vertical-align:middle"></span>已持仓</span>'
         '<span><span style="display:inline-block;width:8px;height:8px;border-radius:2px;'
@@ -269,32 +290,69 @@ def render_pending_section(state: dict, engines: dict, filter_code: str = "") ->
             unsafe_allow_html=True,
         )
 
-        btn_col, dismiss_col = st.columns([5, 1])
+        confirm_key = f"confirm_open_{code}_{grid_level}_{item_type}"
         wrap_cls = "big-confirm-wrap sell-btn" if is_sell else "big-confirm-wrap"
 
-        with btn_col:
-            st.markdown(f'<div class="{wrap_cls}">', unsafe_allow_html=True)
-            btn_text = f"✅ 已按计划成交 · {name} · 第{grid_level + 1}格 · @{grid_price:.3f} HKD"
-            if st.button(btn_text, key=f"bigpend_{code}_{grid_level}_{item_type}", use_container_width=True):
-                engine = engines.get(code)
-                if engine:
-                    if item_type == "buy":
-                        if str(grid_level) not in engine.grid_occupied:
-                            engine.confirm_buy(grid_level)
-                        state["positions"][code] = engine.to_state_dict()
-                        st.toast(f"✅ {name} 第{grid_level + 1}格 买入已记录")
-                    else:
-                        engine.confirm_sell(item.get("holding_id", ""), grid_price)
-                        state["positions"][code] = engine.to_state_dict()
-                        st.toast(f"✅ {name} 第{grid_level + 1}格 卖出已记录")
-                to_remove.append((code, grid_level, item_type))
-                did_action = True
+        if st.session_state.get(confirm_key):
+            # Stage 2: 实际成交价输入层
+            st.markdown(
+                '<div style="background:#F0FDF4;border:1px solid #BBF7D0;border-radius:10px;'
+                'padding:12px 16px;margin-bottom:10px;">'
+                '<div style="font-size:0.75rem;color:#15803D;font-weight:600;margin-bottom:8px;">'
+                '📝 请确认实际成交价（默认为网格触发价，可修改为实际价格）</div>',
+                unsafe_allow_html=True,
+            )
+            price_c, confirm_c, cancel_c = st.columns([4, 1, 1])
+            with price_c:
+                actual_price = st.number_input(
+                    "实际成交价 (HKD)",
+                    value=float(grid_price),
+                    min_value=0.001,
+                    step=0.001,
+                    format="%.3f",
+                    key=f"actual_price_{code}_{grid_level}_{item_type}",
+                    label_visibility="collapsed",
+                )
+            with confirm_c:
+                if st.button("✅ 写入", key=f"final_{code}_{grid_level}_{item_type}",
+                             use_container_width=True):
+                    engine = engines.get(code)
+                    if engine:
+                        if item_type == "buy":
+                            if str(grid_level) not in engine.grid_occupied:
+                                engine.confirm_buy(grid_level, actual_price)
+                            state["positions"][code] = engine.to_state_dict()
+                            st.toast(f"✅ {name} 第{grid_level + 1}格 买入 @{actual_price:.3f} 已记录")
+                        else:
+                            engine.confirm_sell(item.get("holding_id", ""), actual_price)
+                            state["positions"][code] = engine.to_state_dict()
+                            st.toast(f"✅ {name} 第{grid_level + 1}格 卖出 @{actual_price:.3f} 已记录")
+                    st.session_state[confirm_key] = False
+                    to_remove.append((code, grid_level, item_type))
+                    did_action = True
+            with cancel_c:
+                if st.button("✖ 取消", key=f"cancel_{code}_{grid_level}_{item_type}",
+                             use_container_width=True):
+                    st.session_state[confirm_key] = False
+                    st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
-
-        with dismiss_col:
-            if st.button("✖ 忽略", key=f"dismiss_{code}_{grid_level}_{item_type}"):
-                to_remove.append((code, grid_level, item_type))
-                did_action = True
+        else:
+            btn_col, dismiss_col = st.columns([5, 1])
+            with btn_col:
+                st.markdown(f'<div class="{wrap_cls}">', unsafe_allow_html=True)
+                btn_text = (
+                    f"✅ 确认成交 · {name} · 第{grid_level + 1}格"
+                    f" · @{grid_price:.3f} HKD（可改价）"
+                )
+                if st.button(btn_text, key=f"bigpend_{code}_{grid_level}_{item_type}",
+                             use_container_width=True):
+                    st.session_state[confirm_key] = True
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+            with dismiss_col:
+                if st.button("✖ 忽略", key=f"dismiss_{code}_{grid_level}_{item_type}"):
+                    to_remove.append((code, grid_level, item_type))
+                    did_action = True
 
     if to_remove:
         state["pending_confirmations"] = [
@@ -406,6 +464,54 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # 📊 监控页
     # ════════════════════════════════════════════════════════════════
     with tab_monitor:
+        # ── 资产总账看板
+        stats = compute_portfolio_stats(engines, state)
+        p1, p2, p3 = st.columns(3)
+        real_cls = "green" if stats["realized_profit"] >= 0 else "red"
+        with p1:
+            st.markdown(
+                f'<div class="lv-card"><div class="lv-label">资产占用（持仓总市値）</div>'
+                f'<div class="lv-value">{stats["total_market_value"]:,.0f}'
+                f'<span style="font-size:0.85rem;color:#9CA3AF"> HKD</span></div></div>',
+                unsafe_allow_html=True,
+            )
+        with p2:
+            st.markdown(
+                f'<div class="lv-card"><div class="lv-label">🏠 底仓规模</div>'
+                f'<div class="lv-value" style="color:#26A69A">{stats["core_value"]:,.0f}'
+                f'<span style="font-size:0.85rem;color:#9CA3AF"> HKD</span></div></div>',
+                unsafe_allow_html=True,
+            )
+        with p3:
+            st.markdown(
+                f'<div class="lv-card"><div class="lv-label">收割成果（累计已实现）</div>'
+                f'<div class="lv-value {real_cls}">{stats["realized_profit"]:+,.0f}'
+                f'<span style="font-size:0.85rem;color:#9CA3AF"> HKD</span></div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── 资金占用进度条
+        max_cap = settings.get("max_capital_usage", 0)
+        min_hold = settings.get("min_holding_limit", 0)
+        if max_cap > 0:
+            usage_pct = min(stats["total_market_value"] / max_cap, 1.0)
+            st.progress(
+                usage_pct,
+                text=(
+                    f"资金占用 {stats['total_market_value']:,.0f} / {max_cap:,.0f} HKD"
+                    f" ({usage_pct * 100:.1f}%)"
+                ),
+            )
+        if min_hold > 0 and total_holdings < min_hold:
+            st.markdown(
+                f'<div class="lv-alert" style="border-left-color:#D97706;background:#FFFBEB;'  # amber
+                f'border-color:#FDE68A;color:#92400E;">'  
+                f'⚠️ 当前持仓 {total_holdings} 笔，低于底仓保护阈値 {min_hold} 笔</div>',
+                unsafe_allow_html=True,
+            )
+
+        _hr()
+
         g1, g2, g3, g4 = st.columns(4)
         occupied_cnt = len(engine.active_holdings())
         risk_cls = "red" if check_cash_warning(total_risk, cash_reserve) else ""
@@ -504,7 +610,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 pnl_cls = "lv-pnl-pos" if pnl_pct >= 0 else "lv-pnl-neg"
                 tp_price = holding.take_profit_price
 
-                h1, h2, h3, h4 = st.columns([2, 2, 2, 2])
+                h1, h2, h3, h4, h5 = st.columns([2, 2, 2, 1, 1])
                 with h1:
                     st.markdown(
                         f'<div style="color:#9CA3AF;font-size:0.65rem">ID: {holding.holding_id}</div>'
@@ -531,12 +637,29 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                         save_state(state)
                         st.rerun()
                 with h4:
-                    if st.button(f"✅ 卖出 @{tp_price:.3f}", key=f"sell_{holding.holding_id}"):
-                        engine.confirm_sell(holding.holding_id, tp_price)
+                    core_label = "🏠 底仓" if holding.is_core else "⬜ 底仓"
+                    core_color = "color:#26A69A;font-weight:700" if holding.is_core else "color:#9CA3AF"
+                    st.markdown(f'<div style="font-size:0.7rem;margin-bottom:4px;{core_color}">{core_label}</div>',
+                                unsafe_allow_html=True)
+                    if st.button("切换", key=f"core_{holding.holding_id}",
+                                 help="标记/取消底仓：底仓不发止盈提醒"):
+                        engine.toggle_core(holding.holding_id)
                         state["positions"][code] = engine.to_state_dict()
                         save_state(state)
-                        st.toast(f"✅ 已卖出，盈利 {pnl_pct:.2f}%")
                         st.rerun()
+                with h5:
+                    if not holding.is_core:
+                        if st.button(f"✅ 卖出 @{tp_price:.3f}", key=f"sell_{holding.holding_id}"):
+                            engine.confirm_sell(holding.holding_id, tp_price)
+                            state["positions"][code] = engine.to_state_dict()
+                            save_state(state)
+                            st.toast(f"✅ 已卖出，盈利 {pnl_pct:.2f}%")
+                            st.rerun()
+                    else:
+                        st.markdown(
+                            '<div style="font-size:0.65rem;color:#9CA3AF;padding-top:8px;">🏠底仓<br>禁止止盈</div>',
+                            unsafe_allow_html=True,
+                        )
                 _hr()
         else:
             st.markdown(
@@ -641,7 +764,23 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 "监控轮询间隔 (秒)", value=int(settings["poll_interval_seconds"]),
                 min_value=5, max_value=600, step=5, key="g_poll",
             )
-
+        _hr()
+        st.markdown("**📊 持仓与资金阈値**")
+        s5, s6 = st.columns(2)
+        with s5:
+            new_min_hold = st.number_input(
+                "最少持仓数（底仓保护）",
+                value=int(settings.get("min_holding_limit", 0)),
+                min_value=0, max_value=50, step=1, key="g_minhold",
+                help="活跃持仓数低于此値时，主页显示警告；0 = 不启用",
+            )
+        with s6:
+            new_max_cap = st.number_input(
+                "最大资金占用 (HKD)",
+                value=float(settings.get("max_capital_usage", 0)),
+                min_value=0.0, step=50000.0, key="g_maxcap",
+                help="主页资金占用进度条的满格値；0 = 不显示进度条",
+            )
         _hr()
         st.markdown("**🔔 通知推送**")
         s3, s4 = st.columns(2)
@@ -662,6 +801,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             config["settings"].update({
                 "cash_reserve": new_cash, "bark_token": new_bark,
                 "poll_interval_seconds": new_poll, "web_server_url": new_url,
+                "min_holding_limit": int(new_min_hold),
+                "max_capital_usage": float(new_max_cap),
             })
             save_config(config)
             st.toast("✅ 设置已保存，重启生效")
@@ -669,7 +810,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     st.markdown(
         '<div style="text-align:center;color:#E5E7EB;font-size:0.6rem;padding:20px 0 6px;">'
-        'ValueShield v1.5 · 算法为辅，主观为主</div>',
+        'ValueShield v1.6 · 算法为辅，主观为主</div>',
         unsafe_allow_html=True,
     )
 

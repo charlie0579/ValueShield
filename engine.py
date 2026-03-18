@@ -24,6 +24,7 @@ class Holding:
     buy_time: str = ""
     take_profit_pct: float = 0.07
     custom_take_profit_pct: Optional[float] = None
+    is_core: bool = False  # 底仓标记：不触发止盈提醒，热力图显示绿松石色
     sold: bool = False
     sell_price: Optional[float] = None
     sell_time: Optional[str] = None
@@ -57,6 +58,7 @@ class Holding:
             "buy_time": self.buy_time,
             "take_profit_pct": self.take_profit_pct,
             "custom_take_profit_pct": self.custom_take_profit_pct,
+            "is_core": self.is_core,
             "sold": self.sold,
             "sell_price": self.sell_price,
             "sell_time": self.sell_time,
@@ -72,6 +74,7 @@ class Holding:
             buy_time=data.get("buy_time", ""),
             take_profit_pct=data.get("take_profit_pct", 0.07),
             custom_take_profit_pct=data.get("custom_take_profit_pct", None),
+            is_core=data.get("is_core", False),
             sold=data.get("sold", False),
             sell_price=data.get("sell_price", None),
             sell_time=data.get("sell_time", None),
@@ -164,16 +167,17 @@ class GridEngine:
         """
         to_sell = []
         for holding in self.holdings:
-            if not holding.sold and current_price >= holding.take_profit_price:
+            if not holding.sold and not holding.is_core and current_price >= holding.take_profit_price:
                 to_sell.append(holding)
         return to_sell
 
-    def confirm_buy(self, grid_level: int) -> Holding:
+    def confirm_buy(self, grid_level: int, actual_price: Optional[float] = None) -> Holding:
         """
         用户确认某格买入，记录持仓并标记格子占用。
+        actual_price: 实际成交价，为 None 时使用网格触发价。
         """
         prices = self.grid_prices()
-        buy_price = prices[grid_level]
+        buy_price = actual_price if actual_price is not None else prices[grid_level]
         holding = Holding(
             grid_level=grid_level,
             buy_price=buy_price,
@@ -232,6 +236,30 @@ class GridEngine:
             if str(i) not in self.grid_occupied:
                 total_risk += price * self.lot_size
         return round(total_risk, 2)
+
+    def toggle_core(self, holding_id: str) -> bool:
+        """切换底仓标记。底仓不触发止盈提醒，热力图显示绿松石色（#26A69A）。"""
+        for holding in self.holdings:
+            if holding.holding_id == holding_id:
+                holding.is_core = not holding.is_core
+                return True
+        return False
+
+    def total_market_value(self, current_price: float) -> float:
+        """当前持仓总市値（按现价计算）。"""
+        return sum(h.lot_size * current_price for h in self.active_holdings())
+
+    def core_position_value(self, current_price: float) -> float:
+        """底仓市値（仅 is_core=True 的持仓）。"""
+        return sum(h.lot_size * current_price for h in self.active_holdings() if h.is_core)
+
+    def realized_profit(self) -> float:
+        """累计已卖出的网格收益总额。"""
+        return sum(
+            (h.sell_price - h.buy_price) * h.lot_size
+            for h in self.holdings
+            if h.sold and h.sell_price is not None
+        )
 
     def active_holdings(self) -> list[Holding]:
         return [h for h in self.holdings if not h.sold]
