@@ -1,6 +1,6 @@
 """
-app.py - ValueShield v1.7
-灵活条件单架构 · 同花顺持仓看板 · 底仓保护动态屏蔽 · Grid_Count/Quantity 配置
+app.py - ValueShield v1.8
+Bug 修复：session_state 冲突 · 底仓逻辑对齐 · 同步反馈 · 最后更新显示
 """
 
 import json
@@ -319,7 +319,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # ── 顶部标题行（单行，极简）
     title_col, refresh_col = st.columns([9, 1])
     with title_col:
-        last_upd = state.get("last_updated", "—")[:16]
+        last_upd = state.get("last_updated", "")[:16].replace("T", " ") or "未同步"
         pend_color = "#D97706" if n_pending_all > 0 else "#9CA3AF"
         risk_color = "#DC2626" if check_cash_warning(total_risk, cash_reserve) else "#9CA3AF"
         st.markdown(
@@ -328,7 +328,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             f'风险资金 <span style="color:{risk_color};font-weight:600">{total_risk:,.0f}</span> HKD'
             f' · 持仓 <b style="color:#111827">{total_holdings}</b> 笔'
             f' · 待确认 <span style="color:{pend_color};font-weight:600">{n_pending_all}</span> 条'
-            f' · {last_upd}</span>',
+            f' · 🕐 {last_upd}</span>',
             unsafe_allow_html=True,
         )
     with refresh_col:
@@ -523,16 +523,23 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 h_pnl_val = holding.profit_if_sold_at(cp)
                 h_pnl_cls = "lv-pnl-pos" if h_pnl_pct >= 0 else "lv-pnl-neg"
                 tp_price = holding.take_profit_price
-                h1, h2, h3, h4 = st.columns([3, 2, 1, 1])
+                h1, h2, h3 = st.columns([4, 2, 1])
                 with h1:
+                    # 底仓状态：总股数 <= 保护阈值时视为底仓范围
+                    in_core_range = bottom_protected or holding.is_core
                     core_tag = (
                         ' <span style="background:#26A69A;color:#fff;border-radius:4px;'
                         'padding:1px 5px;font-size:0.62rem;">🏠底仓</span>'
                         if holding.is_core else ""
                     )
+                    shield_tag = (
+                        ' <span style="background:#6B7280;color:#fff;border-radius:4px;'
+                        'padding:1px 5px;font-size:0.62rem;">🛡️ 底仓锁定</span>'
+                        if bottom_protected and not holding.is_core else ""
+                    )
                     st.markdown(
                         f'<div style="font-weight:600;color:#111827;">'
-                        f'第 {holding.grid_level + 1} 格 · {holding.lot_size:,} 股{core_tag}</div>'
+                        f'第 {holding.grid_level + 1} 格 · {holding.lot_size:,} 股{core_tag}{shield_tag}</div>'
                         f'<div style="font-size:0.74rem;color:#9CA3AF;">'
                         f'成本 {holding.buy_price:.3f} · 止盈 {tp_price:.3f}</div>',
                         unsafe_allow_html=True,
@@ -544,25 +551,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                         unsafe_allow_html=True,
                     )
                 with h3:
-                    core_label = "🏠 底仓" if holding.is_core else "⬜ 底仓"
-                    core_color = "color:#26A69A;font-weight:700" if holding.is_core else "color:#9CA3AF"
-                    st.markdown(f'<div style="font-size:0.7rem;{core_color}">{core_label}</div>',
-                                unsafe_allow_html=True)
-                    if st.button("切换", key=f"core_{holding.holding_id}",
-                                 help="标记/取消底仓"):
-                        engine.toggle_core(holding.holding_id)
-                        state["positions"][code] = engine.to_state_dict()
-                        save_state(state)
-                        st.rerun()
-                with h4:
-                    if holding.is_core:
+                    if holding.is_core or bottom_protected:
+                        locked_text = "🏠 底仓" if holding.is_core else "🛡️ 保护"
+                        locked_color = "#26A69A" if holding.is_core else "#6B7280"
                         st.markdown(
-                            '<div style="font-size:0.62rem;color:#9CA3AF;">底仓锁定</div>',
-                            unsafe_allow_html=True,
-                        )
-                    elif bottom_protected:
-                        st.markdown(
-                            '<div style="font-size:0.62rem;color:#D97706;">🏠保护中</div>',
+                            f'<div style="font-size:0.72rem;color:{locked_color};'
+                            f'font-weight:600;padding-top:8px;">{locked_text}<br>锁定中</div>',
                             unsafe_allow_html=True,
                         )
                     else:
@@ -599,26 +593,37 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
         st.markdown("**📐 网格参数**")
 
+        # ── 预初始化 session_state，避免 value= 与 key= 同时存在时的 Widget 冲突
+        if f"base_{code}" not in st.session_state:
+            st.session_state[f"base_{code}"] = float(engine.base_price)
+        if f"step_{code}" not in st.session_state:
+            st.session_state[f"step_{code}"] = float(engine._step or 0)
+        if f"gc_{code}" not in st.session_state:
+            st.session_state[f"gc_{code}"] = int(settings.get("grid_levels", 20))
+        if f"qty_{code}" not in st.session_state:
+            st.session_state[f"qty_{code}"] = int(stock_cfg.get("lot_size", 500))
+
         # ── 同步现价为 Base 快捷按钮
         if current_price:
             if st.button(
                 f"📌 同步现价 {current_price:.3f} → Base",
                 key=f"sync_base_{code}",
-                help="将当前市场价填入 Base_Price 输入框，方便快速重置 20 个格子",
+                help="将当前市场价填入 Base_Price 输入框，方便快速重置格子",
             ):
                 st.session_state[f"base_{code}"] = float(current_price)
+                st.toast("✅ 已填充最新市价，请点击【应用】生效")
                 st.rerun()
 
         r1c1, r1c2, r1c3 = st.columns([2, 2, 1])
         with r1c1:
             new_base = st.number_input(
-                "基准价 Base_Price", value=float(engine.base_price),
+                "基准价 Base_Price",
                 min_value=0.01, step=0.01, key=f"base_{code}",
                 help="买入触发价 = Base_Price − (n × Step)",
             )
         with r1c2:
             new_step = st.number_input(
-                "步长 Step（0 = 自动）", value=float(engine._step or 0),
+                "步长 Step（0 = 自动）",
                 min_value=0.0, step=0.001, format="%.4f", key=f"step_{code}",
                 help="相邻格子的价格间距",
             )
@@ -630,14 +635,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         with r2c1:
             new_grid_count = st.number_input(
                 "网格总数 Grid_Count",
-                value=int(settings.get("grid_levels", 20)),
                 min_value=1, max_value=100, step=1, key=f"gc_{code}",
                 help="共布置多少个买入格子；卖出点 = 买入价 × (1 + 止盈比例)",
             )
         with r2c2:
             new_quantity = st.number_input(
                 "单笔股数 Quantity",
-                value=int(stock_cfg.get("lot_size", 500)),
                 min_value=100, step=100, key=f"qty_{code}",
                 help="每格触发时建议买入的股数",
             )
@@ -751,7 +754,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     st.markdown(
         '<div style="text-align:center;color:#E5E7EB;font-size:0.6rem;padding:20px 0 6px;">'
-        'ValueShield v1.7 · 算法为辅，主观为主</div>',
+        'ValueShield v1.8 · 算法为辅，主观为主</div>',
         unsafe_allow_html=True,
     )
 
