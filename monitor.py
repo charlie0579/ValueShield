@@ -95,6 +95,21 @@ def build_engines(config: dict, state: dict) -> dict[str, GridEngine]:
     return engines
 
 
+def _add_pending(state: dict, entry: dict) -> None:
+    """向 state 中添加一条待确认记录（去重：同 code+type+grid_level）。"""
+    pending = state.setdefault("pending_confirmations", [])
+    for existing in pending:
+        if (
+            existing.get("code") == entry.get("code")
+            and existing.get("type") == entry.get("type")
+            and existing.get("grid_level") == entry.get("grid_level")
+            and existing.get("holding_id", "") == entry.get("holding_id", "")
+        ):
+            existing.update(entry)
+            return
+    pending.append(entry)
+
+
 def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier: BarkNotifier) -> dict:
     """
     单次轮询：获取行情 → 检测信号 → 推送通知 → 更新状态。
@@ -136,6 +151,17 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
                 grid_level=level,
                 grid_price=grid_prices[level],
             )
+            _add_pending(state, {
+                "type": "buy",
+                "code": code,
+                "name": stock["name"],
+                "grid_level": level,
+                "grid_price": round(grid_prices[level], 4),
+                "current_price": price,
+                "dividend_yield": round(div_yield, 4),
+                "timestamp": datetime.now().isoformat(),
+                "holding_id": "",
+            })
             logger.info("[%s] 推送买入信号 第%d格 价格=%.4f", code, level + 1, grid_prices[level])
 
         sell_holdings = engine.check_sell_signals(price)
@@ -150,6 +176,19 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
                 profit_pct=holding.profit_pct_if_sold_at(price),
                 holding_id=holding.holding_id,
             )
+            _add_pending(state, {
+                "type": "sell",
+                "code": code,
+                "name": stock["name"],
+                "grid_level": holding.grid_level,
+                "grid_price": round(holding.take_profit_price, 4),
+                "current_price": price,
+                "dividend_yield": round(div_yield, 4),
+                "timestamp": datetime.now().isoformat(),
+                "holding_id": holding.holding_id,
+                "buy_price": holding.buy_price,
+                "profit_pct": round(holding.profit_pct_if_sold_at(price), 4),
+            })
             logger.info("[%s] 推送止盈信号 holding_id=%s", code, holding.holding_id)
 
         state.setdefault("positions", {})[code] = engine.to_state_dict()

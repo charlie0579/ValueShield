@@ -44,21 +44,31 @@ def fetch_realtime_price(akshare_code: str) -> Optional[float]:
     """
     def _fetch():
         symbol = akshare_code.lstrip("0") or "0"
+        logger.info("[%s] 正在调用 stock_hk_spot_em() 获取实时行情...", akshare_code)
         df: pd.DataFrame = ak.stock_hk_spot_em()
-        # 列名：代码, 名称, 最新价, 涨跌额, 涨跌幅, 今开, 最高, 最低, 成交量, 成交额
+        if df is None or df.empty:
+            raise ValueError("stock_hk_spot_em 返回空数据")
+        logger.info("[%s] 接口返回 %d 条数据，列名: %s", akshare_code, len(df), df.columns.tolist())
         row = df[df["代码"] == akshare_code]
         if row.empty:
-            # 尝试去前导零匹配
             row = df[df["代码"] == symbol]
         if row.empty:
-            raise ValueError(f"未找到股票代码 {akshare_code} 的行情数据")
+            all_codes = df["代码"].tolist()[:10]
+            raise ValueError(
+                f"未找到股票代码 {akshare_code}（也尝试了 {symbol}），"
+                f"接口返回代码样本: {all_codes}"
+            )
         price = float(row.iloc[0]["最新价"])
+        logger.info("[%s] 获取到最新价: %.4f HKD", akshare_code, price)
         return price
 
     try:
         return _retry(_fetch)
     except Exception as exc:
-        logger.error("获取 %s 实时价格失败: %s", akshare_code, exc)
+        logger.error(
+            "[%s] 获取实时价格失败（已重试 %d 次）: %s",
+            akshare_code, MAX_RETRIES, exc,
+        )
         return None
 
 
