@@ -60,14 +60,8 @@ class BarkNotifier:
         holding_id: str = "",
     ) -> bool:
         """发送买入提醒。"""
-        title = f"[买入提醒] {code} {name}"
-        body = (
-            f"现价：{current_price:.3f} HKD\n"
-            f"股息率(TTM)：{dividend_yield * 100:.2f}%\n"
-            f"触发档位：第 {grid_level + 1} 格\n"
-            f"触发价：{grid_price:.3f} HKD\n"
-            f"请在手机 App 完成买入后，点击链接确认成交"
-        )
+        title = f"[操作建议] {name}"
+        body = f"买入 @ {grid_price:.3f} HKD"
         callback_url = (
             f"{self.web_server_url}?action=confirm_buy"
             f"&code={code}&level={grid_level}&holding_id={holding_id}"
@@ -86,15 +80,8 @@ class BarkNotifier:
         holding_id: str = "",
     ) -> bool:
         """发送止盈提醒。"""
-        title = f"[止盈提醒] {code} {name}"
-        body = (
-            f"现价：{current_price:.3f} HKD\n"
-            f"股息率(TTM)：{dividend_yield * 100:.2f}%\n"
-            f"触发档位：第 {grid_level + 1} 格\n"
-            f"成本价：{buy_price:.3f} HKD\n"
-            f"预期利润：{profit_pct * 100:.2f}%\n"
-            f"请在手机 App 完成卖出后，点击链接确认成交"
-        )
+        title = f"[操作建议] {name}"
+        body = f"止盈 @ {current_price:.3f} HKD"
         callback_url = (
             f"{self.web_server_url}?action=confirm_sell"
             f"&code={code}&holding_id={holding_id}"

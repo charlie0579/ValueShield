@@ -164,7 +164,7 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
             })
             logger.info("[%s] 推送买入信号 第%d格 价格=%.4f", code, level + 1, grid_prices[level])
 
-        sell_holdings = engine.check_sell_signals(price)
+        sell_holdings = engine.check_sell_signals(price, min_holding_limit=int(settings.get("min_holding_limit", 0)))
         for holding in sell_holdings:
             notifier.notify_sell(
                 code=code,

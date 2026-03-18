@@ -160,11 +160,15 @@ class GridEngine:
                 triggered.append(i)
         return triggered
 
-    def check_sell_signals(self, current_price: float) -> list[Holding]:
+    def check_sell_signals(self, current_price: float, min_holding_limit: int = 0) -> list[Holding]:
         """
         检查当前价是否触发了已持仓的止盈卖出。
-        返回应当卖出的 Holding 列表。
+        min_holding_limit > 0 且总持股数 ≤ 阈値时，屏蔽全部卖出（底仓保护）。
         """
+        if min_holding_limit > 0:
+            total_shares = sum(h.lot_size for h in self.active_holdings())
+            if total_shares <= min_holding_limit:
+                return []  # 底仓保护：持股总数未超过阈値，屏蔽全部卖出
         to_sell = []
         for holding in self.holdings:
             if not holding.sold and not holding.is_core and current_price >= holding.take_profit_price:
