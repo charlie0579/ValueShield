@@ -162,7 +162,7 @@ def render_sidebar(config: dict, state: dict) -> str:
         st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
 
         search = st.text_input(
-            "", placeholder="🔍 搜索名称/代码",
+            "搜索", placeholder="🔍 搜索名称/代码",
             label_visibility="collapsed", key="sidebar_search",
         )
         filtered = [
@@ -286,15 +286,18 @@ def render_auto_align(engine: GridEngine, code: str, current_price: float, state
         st.success("✅ 所有触发格子已对齐，无需校准。")
         return False
 
-    st.warning(f"检测到 {len(to_fill)} 个格子触发价高于现价 {current_price:.3f} HKD，尚未记录持仓。")
-    st.caption("  ".join(f"第{i + 1}格 {prices[i]:.3f}" for i in to_fill))
-
-    if st.button(f"🎯 一键对齐 {len(to_fill)} 格", key=f"align_{code}"):
+    st.info(f"📐 现价 {current_price:.3f} HKD 偏离基准价较大，共 {len(to_fill)} 格待对齐，建议一键对齐。")
+    if st.button("🎯 一键对齐", key=f"align_{code}"):
         for i in to_fill:
             engine.confirm_buy(i)
+        # 同时清除该标的所有历史待确认提醒
+        state["pending_confirmations"] = [
+            p for p in state.get("pending_confirmations", [])
+            if p.get("code") != code
+        ]
         state["positions"][code] = engine.to_state_dict()
         save_state(state)
-        st.success(f"✅ 已对齐 {len(to_fill)} 格！")
+        st.toast(f"✅ 已对齐 {len(to_fill)} 格，历史待确认提醒已清除。")
         return True
     return False
 
@@ -373,28 +376,34 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         # ── 资产总账看板
         stats = compute_portfolio_stats(engines, state)
         p1, p2, p3 = st.columns(3)
-        real_cls = "green" if stats["realized_profit"] >= 0 else "red"
+        pnl_color = "#10B981" if stats["realized_profit"] >= 0 else "#EF4444"
         with p1:
-            st.markdown(
-                f'<div class="lv-card"><div class="lv-label">资产占用（持仓总市値）</div>'
-                f'<div class="lv-value">{stats["total_market_value"]:,.0f}'
-                f'<span style="font-size:0.85rem;color:#9CA3AF"> HKD</span></div></div>',
-                unsafe_allow_html=True,
-            )
+            with st.container(border=True):
+                st.caption("资产占用（持仓总市值）")
+                st.markdown(
+                    f'<div style="font-size:1.55rem;font-weight:700;color:#111827;line-height:1.2;">'
+                    f'{stats["total_market_value"]:,.0f}'
+                    f'<span style="font-size:0.82rem;color:#9CA3AF;font-weight:400;"> HKD</span></div>',
+                    unsafe_allow_html=True,
+                )
         with p2:
-            st.markdown(
-                f'<div class="lv-card"><div class="lv-label">🏠 底仓规模</div>'
-                f'<div class="lv-value" style="color:#26A69A">{stats["core_value"]:,.0f}'
-                f'<span style="font-size:0.85rem;color:#9CA3AF"> HKD</span></div></div>',
-                unsafe_allow_html=True,
-            )
+            with st.container(border=True):
+                st.caption("🏠 底仓规模")
+                st.markdown(
+                    f'<div style="font-size:1.55rem;font-weight:700;color:#26A69A;line-height:1.2;">'
+                    f'{stats["core_value"]:,.0f}'
+                    f'<span style="font-size:0.82rem;color:#9CA3AF;font-weight:400;"> HKD</span></div>',
+                    unsafe_allow_html=True,
+                )
         with p3:
-            st.markdown(
-                f'<div class="lv-card"><div class="lv-label">收割成果（累计已实现）</div>'
-                f'<div class="lv-value {real_cls}">{stats["realized_profit"]:+,.0f}'
-                f'<span style="font-size:0.85rem;color:#9CA3AF"> HKD</span></div></div>',
-                unsafe_allow_html=True,
-            )
+            with st.container(border=True):
+                st.caption("收割成果（累计已实现）")
+                st.markdown(
+                    f'<div style="font-size:1.55rem;font-weight:700;color:{pnl_color};line-height:1.2;">'
+                    f'{stats["realized_profit"]:+,.0f}'
+                    f'<span style="font-size:0.82rem;color:#9CA3AF;font-weight:400;"> HKD</span></div>',
+                    unsafe_allow_html=True,
+                )
 
         # ── 资金占用进度条
         max_cap = settings.get("max_capital_usage", 0)
@@ -477,6 +486,30 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 else:
                     st.error("获取失败")
 
+        # ── 紧急校准：数据源彻底失效时手动输入现价
+        with st.expander("🚨 紧急校准（数据源失效时使用）", expanded=False):
+            st.caption("仅在行情接口全部失效、显示价格明显错误时使用。输入后点击【覆盖现价】立即生效。")
+            manual_col, btn_col = st.columns([3, 1])
+            with manual_col:
+                manual_price_key = f"manual_price_{code}"
+                if manual_price_key not in st.session_state:
+                    st.session_state[manual_price_key] = float(current_price or 0.0)
+                manual_price = st.number_input(
+                    "手动输入现价（HKD）",
+                    min_value=0.001, step=0.01, format="%.3f",
+                    key=manual_price_key,
+                )
+            with btn_col:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("✏️ 覆盖现价", key=f"override_price_{code}"):
+                    if manual_price and manual_price > 0:
+                        state.setdefault("latest_prices", {})[code] = float(manual_price)
+                        save_state(state)
+                        st.toast(f"✅ 现价已手动覆盖为 {manual_price:.3f} HKD")
+                        st.rerun()
+                    else:
+                        st.error("请输入有效价格")
+
         active = engine.active_holdings()
         total_shares = sum(h.lot_size for h in active)
         total_cost_val = sum(h.buy_price * h.lot_size for h in active)
@@ -521,45 +554,54 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             for holding in active:
                 h_pnl_pct = holding.profit_pct_if_sold_at(cp) * 100
                 h_pnl_val = holding.profit_if_sold_at(cp)
-                h_pnl_cls = "lv-pnl-pos" if h_pnl_pct >= 0 else "lv-pnl-neg"
                 tp_price = holding.take_profit_price
-                h1, h2, h3 = st.columns([4, 2, 1])
-                with h1:
-                    # 底仓状态：总股数 <= 保护阈值时视为底仓范围
-                    in_core_range = bottom_protected or holding.is_core
-                    core_tag = (
-                        ' <span style="background:#26A69A;color:#fff;border-radius:4px;'
-                        'padding:1px 5px;font-size:0.62rem;">🏠底仓</span>'
-                        if holding.is_core else ""
-                    )
-                    shield_tag = (
-                        ' <span style="background:#6B7280;color:#fff;border-radius:4px;'
-                        'padding:1px 5px;font-size:0.62rem;">🛡️ 底仓锁定</span>'
-                        if bottom_protected and not holding.is_core else ""
-                    )
+                in_core_range = bottom_protected or holding.is_core
+
+                if in_core_range:
+                    # 底仓行：整行绿松石色背景 + 🔒 锁定图标
+                    pnl_c = "#10B981" if h_pnl_pct >= 0 else "#EF4444"
+                    lock_label = "🔒 底仓锁定" if holding.is_core else "🔒 阈值保护"
                     st.markdown(
-                        f'<div style="font-weight:600;color:#111827;">'
-                        f'第 {holding.grid_level + 1} 格 · {holding.lot_size:,} 股{core_tag}{shield_tag}</div>'
-                        f'<div style="font-size:0.74rem;color:#9CA3AF;">'
-                        f'成本 {holding.buy_price:.3f} · 止盈 {tp_price:.3f}</div>',
+                        f'<div style="background:#E0F2F1;border-left:3px solid #26A69A;'
+                        f'border-radius:8px;padding:8px 14px;margin-bottom:6px;'
+                        f'display:flex;justify-content:space-between;align-items:center;">'
+                        f'  <div>'
+                        f'    <span style="font-weight:600;color:#111827;">'
+                        f'第 {holding.grid_level + 1} 格 · {holding.lot_size:,} 股</span>'
+                        f'    <span style="background:#26A69A;color:#fff;border-radius:4px;'
+                        f'padding:1px 6px;font-size:0.62rem;margin-left:6px;">🔒 锁定</span>'
+                        f'    <div style="font-size:0.74rem;color:#5eada5;margin-top:2px;">'
+                        f'成本 {holding.buy_price:.3f} · 止盈 {tp_price:.3f}</div>'
+                        f'  </div>'
+                        f'  <div style="text-align:right;">'
+                        f'    <div style="font-size:1.05rem;font-weight:700;color:{pnl_c};">'
+                        f'{h_pnl_pct:+.2f}%</div>'
+                        f'    <div style="font-size:0.78rem;color:#6B7280;">{h_pnl_val:+,.0f} HKD</div>'
+                        f'    <div style="font-size:0.7rem;color:#26A69A;font-weight:600;margin-top:2px;">'
+                        f'{lock_label}</div>'
+                        f'  </div>'
+                        f'</div>',
                         unsafe_allow_html=True,
                     )
-                with h2:
-                    st.markdown(
-                        f'<div class="{h_pnl_cls}" style="font-size:1.05rem;">{h_pnl_pct:+.2f}%</div>'
-                        f'<div style="color:#6B7280;font-size:0.78rem;">{h_pnl_val:+,.0f} HKD</div>',
-                        unsafe_allow_html=True,
-                    )
-                with h3:
-                    if holding.is_core or bottom_protected:
-                        locked_text = "🏠 底仓" if holding.is_core else "🛡️ 保护"
-                        locked_color = "#26A69A" if holding.is_core else "#6B7280"
+                else:
+                    # 普通行：列布局 + 卖出按钮
+                    h_pnl_cls = "lv-pnl-pos" if h_pnl_pct >= 0 else "lv-pnl-neg"
+                    h1, h2, h3 = st.columns([4, 2, 1])
+                    with h1:
                         st.markdown(
-                            f'<div style="font-size:0.72rem;color:{locked_color};'
-                            f'font-weight:600;padding-top:8px;">{locked_text}<br>锁定中</div>',
+                            f'<div style="font-weight:600;color:#111827;">'
+                            f'第 {holding.grid_level + 1} 格 · {holding.lot_size:,} 股</div>'
+                            f'<div style="font-size:0.74rem;color:#9CA3AF;">'
+                            f'成本 {holding.buy_price:.3f} · 止盈 {tp_price:.3f}</div>',
                             unsafe_allow_html=True,
                         )
-                    else:
+                    with h2:
+                        st.markdown(
+                            f'<div class="{h_pnl_cls}" style="font-size:1.05rem;">{h_pnl_pct:+.2f}%</div>'
+                            f'<div style="color:#6B7280;font-size:0.78rem;">{h_pnl_val:+,.0f} HKD</div>',
+                            unsafe_allow_html=True,
+                        )
+                    with h3:
                         if st.button("✅ 卖出", key=f"sell_{holding.holding_id}",
                                      help=f"止盈价 @{tp_price:.3f} HKD"):
                             engine.confirm_sell(holding.holding_id, tp_price)

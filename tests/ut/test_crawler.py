@@ -12,41 +12,7 @@ from crawler import (
     fetch_dividend_ttm,
     fetch_stock_name,
     compute_dividend_yield,
-    _retry,
 )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# _retry 通用重试机制
-# ─────────────────────────────────────────────────────────────────────────────
-class TestRetry:
-    def test_success_on_first_attempt(self):
-        func = MagicMock(return_value=42)
-        func.__name__ = "mock_func"
-        result = _retry(func, retries=3, delay=0)
-        assert result == 42
-        func.assert_called_once()
-
-    def test_success_on_second_attempt(self):
-        func = MagicMock(side_effect=[Exception("err"), 99])
-        func.__name__ = "mock_func"
-        result = _retry(func, retries=3, delay=0)
-        assert result == 99
-        assert func.call_count == 2
-
-    def test_raises_after_max_retries(self):
-        func = MagicMock(side_effect=Exception("always fails"))
-        func.__name__ = "mock_func"
-        with pytest.raises(RuntimeError, match="always fails"):
-            _retry(func, retries=3, delay=0)
-        assert func.call_count == 3
-
-    def test_exact_retry_count(self):
-        func = MagicMock(side_effect=[ValueError("1"), ValueError("2"), "ok"])
-        func.__name__ = "mock_func"
-        result = _retry(func, retries=3, delay=0)
-        assert result == "ok"
-        assert func.call_count == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,22 +40,32 @@ class TestFetchRealtimePrice:
             result = fetch_realtime_price("99999")
         assert result is None
 
-    def test_retries_on_transient_error(self):
-        df = self._make_spot_df("01336", 30.0)
-        call_count = 0
-
-        def flaky_spot():
-            nonlocal call_count
-            call_count += 1
-            if call_count < 3:
-                raise ConnectionError("transient")
-            return df
-
-        with patch("akshare.stock_hk_spot_em", side_effect=flaky_spot):
-            with patch("time.sleep"):
+    def test_falls_back_to_sina_when_akshare_fails(self):
+        """AkShare 失败时自动降级到新浪通道（现代 hk格式）。"""
+        import crawler as _crawler
+        _crawler._last_known_prices.pop("01336", None)  # 清除偏差校验状态
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        # 新浪现代格式：var hq_str_hk01336="名称,昨收,现价,..."
+        mock_resp.text = 'var hq_str_hk01336="新华保险,29.0,30.5,...";'
+        with patch("akshare.stock_hk_spot_em", side_effect=Exception("timeout")):
+            with patch("requests.get", return_value=mock_resp):
                 result = fetch_realtime_price("01336")
-        assert result == pytest.approx(30.0)
-        assert call_count == 3
+        assert result == pytest.approx(30.5)
+
+    def test_channel_memory_updates_on_fallback(self):
+        """备用通道成功后，_preferred_channel 应更新为 sina。"""
+        import crawler as _crawler
+        _crawler._preferred_channel = "akshare"  # 重置初始状态
+        _crawler._last_known_prices.pop("01336", None)  # 清除偏差校验状态
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.text = 'var hq_str_hk01336="新华保险,27.0,28.0,...";'
+        with patch("akshare.stock_hk_spot_em", side_effect=Exception("ak down")):
+            with patch("requests.get", return_value=mock_resp):
+                fetch_realtime_price("01336")
+        assert _crawler._preferred_channel == "sina"
+        _crawler._preferred_channel = "akshare"  # 恢复默认状态
 
     def test_returns_float_type(self):
         df = self._make_spot_df("00525", 4.2)
@@ -189,3 +165,58 @@ class TestComputeDividendYield:
     def test_high_yield_scenario(self):
         result = compute_dividend_yield(5.0, 20.0)
         assert result == pytest.approx(0.25)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 价格偏差校验 & EM Web 第三通道
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPriceDriftAndEmWeb:
+    def setup_method(self):
+        """每个测试前清除 _last_known_prices 状态。"""
+        import crawler as _crawler
+        _crawler._last_known_prices.pop("01336", None)
+
+    def test_em_web_triggered_on_large_drift(self):
+        """价格偏差 > 20% 时触发 EM Web 第三通道，最终采用 EM Web 结果。"""
+        import crawler as _crawler
+        _crawler._last_known_prices["01336"] = 28.0  # 上次已知价
+        # AkShare 返回 50.0，偏差 78% > 20%，应触发 EM Web
+        df = pd.DataFrame([{"代码": "01336", "名称": "新华保险", "最新价": "50.0"}])
+        em_resp = MagicMock()
+        em_resp.raise_for_status = MagicMock()
+        em_resp.json.return_value = {"data": {"f43": 28500, "f57": "01336"}}
+        with patch("akshare.stock_hk_spot_em", return_value=df):
+            with patch("requests.get", return_value=em_resp):
+                result = fetch_realtime_price("01336")
+        # EM Web 返回 28500÷1000 = 28.5
+        assert result == pytest.approx(28.5)
+        _crawler._last_known_prices.pop("01336", None)
+
+    def test_no_em_web_when_drift_small(self):
+        """价格偏差 < 20% 时不触发 EM Web，直接返回 AkShare 结果。"""
+        import crawler as _crawler
+        _crawler._last_known_prices["01336"] = 28.0  # 上次已知价
+        # AkShare 返回 29.0，偏差 3.6% < 20%，不应发起额外 HTTP 请求
+        df = pd.DataFrame([{"代码": "01336", "名称": "新华保险", "最新价": "29.0"}])
+        with patch("akshare.stock_hk_spot_em", return_value=df):
+            with patch("requests.get") as mock_get:
+                result = fetch_realtime_price("01336")
+        mock_get.assert_not_called()
+        assert result == pytest.approx(29.0)
+        _crawler._last_known_prices.pop("01336", None)
+
+    def test_price_drift_warning_logged(self, caplog):
+        """偏差 > 20% 时记录 WARNING 日志。"""
+        import logging
+        import crawler as _crawler
+        _crawler._last_known_prices["01336"] = 28.0
+        df = pd.DataFrame([{"代码": "01336", "名称": "新华保险", "最新价": "50.0"}])
+        em_resp = MagicMock()
+        em_resp.raise_for_status = MagicMock()
+        em_resp.json.return_value = {"data": {"f43": 28500, "f57": "01336"}}
+        with caplog.at_level(logging.WARNING, logger="crawler"):
+            with patch("akshare.stock_hk_spot_em", return_value=df):
+                with patch("requests.get", return_value=em_resp):
+                    fetch_realtime_price("01336")
+        assert any("drift" in r.message.lower() or "偏差" in r.message for r in caplog.records)
+        _crawler._last_known_prices.pop("01336", None)

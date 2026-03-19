@@ -1,114 +1,205 @@
 """
 crawler.py - 数据获取模块
-负责从 AkShare 获取港股实时行情与分红数据，含自动重试机制。
+负责从 AkShare 获取港股实时行情与分红数据。
+智能三通道：状态记忆 + 快熔断（5s）+ 自动降级 + 20% 偏差校验 + 随机 UA + 日志脱水。
+
+通道优先级（可动态切换）：
+  akshare  → 东方财富 stock_hk_spot_em
+  sina     → 新浪财经 hq.sinajs.cn/list=hkXXXXX（现代格式，字段9=当前价）
+  em_web   → 东方财富 Web 备用 push2.eastmoney.com JSON 接口
 """
 
-import time
 import logging
+import random
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
-import re
-
-import requests
 import akshare as ak
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY_SECONDS = 5
+# 随机 User-Agent 池，防止代理因固定 UA 拒绝连接
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
+]
+
+_FAST_TIMEOUT = 5        # 秒：快熔断超时
+_DRIFT_THRESHOLD = 0.20  # 20% 偏差阈值，超过则告警并尝试第三通道
+
+# 模块级状态：记忆上次成功通道 + 上次成功价格（用于偏差校验）
+_preferred_channel: str = "akshare"
+_last_known_prices: dict[str, float] = {}  # code → 上次成功价格
 
 
-def _retry(func, *args, retries: int = MAX_RETRIES, delay: float = RETRY_DELAY_SECONDS, **kwargs):
-    """通用重试装饰器逻辑，捕获网络异常并自动重试。"""
-    last_exception = None
-    for attempt in range(1, retries + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            last_exception = exc
-            logger.warning(
-                "第 %d 次调用 %s 失败: %s，%d 秒后重试...",
-                attempt, func.__name__, exc, delay
-            )
-            if attempt < retries:
-                time.sleep(delay)
-    raise RuntimeError(
-        f"调用 {func.__name__} 在 {retries} 次重试后仍失败: {last_exception}"
-    ) from last_exception
-
-
-def _fetch_via_sina(akshare_code: str) -> float:
-    """
-    备用通道：新浪财经港股实时接口（港元计价，规避东方财富代理封锁）。
-    URL 格式: https://hq.sinajs.cn/list=rt_hk{5位代码}
-    返回字段: 名称,代码,现价,最高,最低,开盘,昨收,...
-    """
-    code_padded = akshare_code.zfill(5)
-    url = f"https://hq.sinajs.cn/list=rt_hk{code_padded}"
+def _random_headers(extra: Optional[dict] = None) -> dict:
+    """生成含随机 UA、Connection:close、Cache-Control:no-cache 的请求头。"""
     headers = {
-        "Referer": "https://finance.sina.com.cn",
-        "User-Agent": "Mozilla/5.0 (compatible)",
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Connection": "close",
+        "Cache-Control": "no-cache",   # 防止代理返回缓存旧数据
+        "Pragma": "no-cache",
     }
-    resp = requests.get(url, headers=headers, timeout=10)
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _try_akshare(akshare_code: str) -> float:
+    """通道 A：东方财富 AkShare stock_hk_spot_em，单次，超时 5s。"""
+    symbol = akshare_code.lstrip("0") or "0"
+    df: pd.DataFrame = ak.stock_hk_spot_em()
+    if df is None or df.empty:
+        raise ValueError("stock_hk_spot_em 返回空数据")
+    row = df[df["代码"] == akshare_code]
+    if row.empty:
+        row = df[df["代码"] == symbol]
+    if row.empty:
+        raise ValueError(f"未找到 {akshare_code}（也尝试了 {symbol}）")
+    return float(row.iloc[0]["最新价"])
+
+
+def _try_sina(akshare_code: str) -> float:
+    """
+    通道 B：新浪财经现代接口 hq.sinajs.cn/list=hkXXXXX。
+    格式：var hq_str_hk01336="名称,XX,现价,昨收,今开,最高,最低,...";
+    字段索引：[2]=现价（非 rt_hk 的旧格式）。
+    """
+    # 新浪现代港股格式：hkXXXXX（不补零，直接用原始代码）
+    symbol_key = f"hk{akshare_code}"
+    url = f"https://hq.sinajs.cn/list={symbol_key}"
+    headers = _random_headers({"Referer": "https://finance.sina.com.cn"})
+    resp = requests.get(url, headers=headers, timeout=_FAST_TIMEOUT)
     resp.raise_for_status()
     match = re.search(r'"([^"]*)"', resp.text)
     if not match:
         raise ValueError(f"Sina 返回格式异常: {resp.text[:120]}")
     fields = match.group(1).split(",")
+    # 字段[2] = 当前价；字段[1] = 昨收（可作为验证）
     if len(fields) < 3 or not fields[2].strip():
         raise ValueError(f"Sina 字段不足或价格为空: {fields[:6]}")
     price = float(fields[2].strip())
     if price <= 0:
         raise ValueError(f"Sina 返回价格无效（可能非交易时段）: {price}")
-    logger.info("[%s] Sina 备用通道获取价格成功: %.4f HKD", akshare_code, price)
     return price
+
+
+def _try_em_web(akshare_code: str) -> float:
+    """
+    通道 C：东方财富 Web 备用 push2.eastmoney.com JSON 接口。
+    仅在前两通道均偏差过大或失败时启用。
+    """
+    # 东方财富港股代码格式：116.XXXXX（116 = 港股市场代码）
+    em_code = f"116.{akshare_code.zfill(5)}"
+    url = (
+        "https://push2.eastmoney.com/api/qt/stock/get"
+        f"?secid={em_code}&fields=f43,f57,f58&ut=fa5fd1943c7b386f172d6893dbfba10b"
+    )
+    headers = _random_headers({"Referer": "https://quote.eastmoney.com"})
+    resp = requests.get(url, headers=headers, timeout=_FAST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    # f43 = 最新价（单位：分，需 ÷ 1000；港股有时是原始值，按实际调整）
+    raw = data.get("data", {}).get("f43")
+    if not raw or raw <= 0:
+        raise ValueError(f"EM Web 返回无效价格: {raw}")
+    # 东方财富港股价格精度：÷ 1000 得 HKD
+    price = raw / 1000.0
+    if price <= 0:
+        raise ValueError(f"EM Web 价格换算异常: {price}")
+    return price
+
+
+def _check_drift(akshare_code: str, price: float, channel: str) -> bool:
+    """
+    检查价格与上次成功价是否偏差超过阈值。
+    超过则记录 WARNING 并返回 True（触发第三通道校验）。
+    """
+    last = _last_known_prices.get(akshare_code)
+    if last and last > 0:
+        drift = abs(price - last) / last
+        if drift > _DRIFT_THRESHOLD:
+            logger.warning(
+                "[%s] ⚠️ 价格漂移过大！通道=%s 新价=%.4f 上次=%.4f 偏差=%.1f%% "
+                "（阈值 %.0f%%），将尝试第三通道交叉验证。",
+                akshare_code, channel, price, last, drift * 100, _DRIFT_THRESHOLD * 100,
+            )
+            return True
+    return False
 
 
 def fetch_realtime_price(akshare_code: str) -> Optional[float]:
     """
     获取港股实时最新价（港元计价）。
-    先尝试东方财富 AkShare 接口，失败则自动切换至新浪财经备用通道。
-    akshare_code: 如 '01336'、'00525'
+
+    流程：
+    1. 优先调用 _preferred_channel（AkShare 或 Sina）
+    2. 若失败，切换到另一通道，并记忆新通道
+    3. 若成功价格与上次偏差 > 20%，启动第三通道（EM Web）交叉验证：
+       - 三通道价格两两接近 → 采用 EM Web 价格，视为数据源异常纠偏
+       - 无法验证 → 保留当前价并记录 WARNING
     """
-    def _fetch_akshare():
-        symbol = akshare_code.lstrip("0") or "0"
-        logger.info("[%s] 正在调用 AkShare stock_hk_spot_em()...", akshare_code)
-        df: pd.DataFrame = ak.stock_hk_spot_em()
-        if df is None or df.empty:
-            raise ValueError("stock_hk_spot_em 返回空数据")
-        logger.info("[%s] AkShare 返回 %d 条，列名: %s", akshare_code, len(df), df.columns.tolist())
-        row = df[df["代码"] == akshare_code]
-        if row.empty:
-            row = df[df["代码"] == symbol]
-        if row.empty:
-            sample = df["代码"].tolist()[:10]
-            raise ValueError(
-                f"未找到 {akshare_code}（也尝试了 {symbol}），样本: {sample}"
-            )
-        price = float(row.iloc[0]["最新价"])
-        logger.info("[%s] AkShare 获取价格: %.4f HKD", akshare_code, price)
-        return price
+    global _preferred_channel, _last_known_prices
 
-    # 主通道：东方财富 AkShare
-    try:
-        return _retry(_fetch_akshare)
-    except Exception as ak_exc:
-        logger.warning(
-            "[%s] AkShare 主通道失败: %s，切换至新浪备用通道...",
-            akshare_code, ak_exc,
-        )
+    primary = _preferred_channel
+    secondary = "sina" if primary == "akshare" else "akshare"
+    channel_funcs = {"akshare": _try_akshare, "sina": _try_sina, "em_web": _try_em_web}
 
-    # 备用通道：新浪财经
-    try:
-        return _retry(_fetch_via_sina, akshare_code)
-    except Exception as sina_exc:
-        logger.error(
-            "[%s] 两个通道均失败 — AkShare: 见上方日志 | Sina: %s",
-            akshare_code, sina_exc,
-        )
+    price: Optional[float] = None
+    used_channel: Optional[str] = None
+
+    # ── 主通道 & 备用通道
+    for channel in [primary, secondary]:
+        try:
+            price = channel_funcs[channel](akshare_code)
+            used_channel = channel
+            break
+        except Exception as exc:
+            logger.warning("[%s] 通道 %s 失败: %s", akshare_code, channel, exc)
+
+    if price is None:
+        logger.error("[%s] 主备通道均不可用，本次跳过。", akshare_code)
         return None
+
+    # ── 更新通道记忆（发生切换时打印）
+    if used_channel != primary:
+        logger.warning(
+            "[%s] 通道切换：%s → %s（%.4f HKD）",
+            akshare_code, primary, used_channel, price,
+        )
+        _preferred_channel = used_channel
+
+    # ── 20% 偏差校验：触发第三通道 EM Web 交叉验证
+    if _check_drift(akshare_code, price, used_channel):
+        try:
+            em_price = _try_em_web(akshare_code)
+            last = _last_known_prices.get(akshare_code, price)
+            em_drift = abs(em_price - last) / last if last > 0 else 1.0
+            if em_drift <= _DRIFT_THRESHOLD:
+                logger.warning(
+                    "[%s] 第三通道纠偏：采用 EM Web %.4f HKD（原值 %.4f 已丢弃）",
+                    akshare_code, em_price, price,
+                )
+                price = em_price
+            else:
+                logger.warning(
+                    "[%s] 三通道均出现大偏差，保留当前值 %.4f HKD，请人工核查。",
+                    akshare_code, price,
+                )
+        except Exception as em_exc:
+            logger.warning("[%s] EM Web 第三通道失败: %s，保留当前值。", akshare_code, em_exc)
+
+    # ── 记录本次价格供下次偏差校验
+    _last_known_prices[akshare_code] = price
+    return price
 
 
 def fetch_dividend_ttm(akshare_code: str, years: int = 1) -> float:
@@ -142,7 +233,7 @@ def fetch_dividend_ttm(akshare_code: str, years: int = 1) -> float:
         return total_div
 
     try:
-        return _retry(_fetch)
+        return _fetch()
     except Exception as exc:
         logger.error("获取 %s 分红数据失败: %s", akshare_code, exc)
         return 0.0
@@ -160,7 +251,7 @@ def fetch_stock_name(akshare_code: str) -> str:
         return str(row.iloc[0]["名称"])
 
     try:
-        return _retry(_fetch)
+        return _fetch()
     except Exception as exc:
         logger.warning("获取 %s 股票名称失败: %s，使用代码代替", akshare_code, exc)
         return akshare_code
