@@ -220,3 +220,55 @@ class TestPriceDriftAndEmWeb:
                     fetch_realtime_price("01336")
         assert any("drift" in r.message.lower() or "偏差" in r.message for r in caplog.records)
         _crawler._last_known_prices.pop("01336", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.4 估值分位函数
+# ─────────────────────────────────────────────────────────────────────────────
+from crawler import compute_percentile, get_valuation_label
+
+
+class TestComputePercentile:
+    def test_insufficient_data_returns_minus_one(self):
+        assert compute_percentile(5.0, [1.0, 2.0, 3.0]) == -1.0
+
+    def test_higher_is_better_100pct(self):
+        # 当前值最高 → 分位=100%
+        result = compute_percentile(10.0, [2.0, 4.0, 6.0, 8.0, 10.0], higher_is_better=True)
+        assert result == pytest.approx(100.0)
+
+    def test_higher_is_better_0pct(self):
+        # 当前值最低 → 分位=20%（只有一个 <= 1.0 的）
+        result = compute_percentile(1.0, [1.0, 4.0, 6.0, 8.0, 10.0], higher_is_better=True)
+        assert result == pytest.approx(20.0)
+
+    def test_lower_is_better_100pct(self):
+        # PB 当前最低 → 历史所有都 >= → 分位=100%
+        result = compute_percentile(0.5, [0.5, 0.8, 1.0, 1.2, 1.5], higher_is_better=False)
+        assert result == pytest.approx(100.0)
+
+    def test_lower_is_better_0pct(self):
+        # PB 当前最高 → 无历史 >= → 分位=0%（只有当前=最高本身）
+        result = compute_percentile(2.0, [0.5, 0.8, 1.0, 1.2, 2.0], higher_is_better=False)
+        assert result == pytest.approx(20.0)
+
+    def test_all_zeros_filtered(self):
+        # 历史含 0 应被过滤
+        result = compute_percentile(5.0, [0.0, 0.0, 0.0, 5.0], higher_is_better=True)
+        assert result == -1.0  # 过滤后只剩 1 个有效值，不足 4 个
+
+
+class TestGetValuationLabel:
+    def test_label_extreme_underval(self):
+        label = get_valuation_label(92.0, "股息率", 8.5, "%")
+        assert "极度低估" in label
+        assert "🚀" in label
+
+    def test_label_overval(self):
+        label = get_valuation_label(15.0, "PB", 2.5, "x")
+        assert "高估" in label
+        assert "🔴" in label
+
+    def test_label_no_data(self):
+        label = get_valuation_label(-1.0, "股息率", 6.0, "%")
+        assert "历史数据不足" in label

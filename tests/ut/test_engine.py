@@ -576,3 +576,146 @@ class TestPortfolioStats:
     def test_realized_profit_does_not_count_active_holdings(self, engine_1336: GridEngine):
         engine_1336.confirm_buy(0, actual_price=25.0)  # 未卖出，不计入
         assert engine_1336.realized_profit() == pytest.approx(0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.4 新增：PositionSummary / WatcherTarget / v2 信号方法
+# ─────────────────────────────────────────────────────────────────────────────
+from engine import PositionSummary, WatcherTarget, compute_total_risk_capital_v2
+
+
+class TestPositionSummary:
+    def test_band_shares(self):
+        ps = PositionSummary(total_shares=10000, avg_cost=28.0, core_shares=2000, total_budget=300000)
+        assert ps.band_shares == 8000
+
+    def test_band_shares_zero_when_all_core(self):
+        ps = PositionSummary(total_shares=5000, avg_cost=28.0, core_shares=5000)
+        assert ps.band_shares == 0
+
+    def test_cost_value(self):
+        ps = PositionSummary(total_shares=10000, avg_cost=28.5)
+        assert ps.cost_value == pytest.approx(285000.0)
+
+    def test_market_value(self):
+        ps = PositionSummary(total_shares=10000, avg_cost=28.5)
+        assert ps.market_value(30.0) == pytest.approx(300000.0)
+
+    def test_unrealized_pnl_positive(self):
+        ps = PositionSummary(total_shares=10000, avg_cost=28.0)
+        assert ps.unrealized_pnl(30.0) == pytest.approx(20000.0)
+
+    def test_unrealized_pnl_pct(self):
+        ps = PositionSummary(total_shares=10000, avg_cost=28.0)
+        assert ps.unrealized_pnl_pct(30.0) == pytest.approx(2.0 / 28.0)
+
+    def test_risk_capital_needed(self):
+        ps = PositionSummary(total_shares=5000, avg_cost=28.0, total_budget=300000)
+        # 现价 30：市值=150000，风险需求=150000
+        assert ps.risk_capital_needed(30.0) == pytest.approx(150000.0)
+
+    def test_risk_capital_needed_zero_when_full(self):
+        ps = PositionSummary(total_shares=10000, avg_cost=30.0, total_budget=200000)
+        # 市值=300000 > 预算=200000，需求=0
+        assert ps.risk_capital_needed(30.0) == pytest.approx(0.0)
+
+    def test_budget_usage_pct(self):
+        ps = PositionSummary(total_shares=5000, avg_cost=28.0, total_budget=300000)
+        # cost_value=140000 / 300000 ≈ 0.467
+        assert ps.budget_usage_pct(30.0) == pytest.approx(140000 / 300000)
+
+    def test_budget_usage_pct_no_budget(self):
+        ps = PositionSummary(total_shares=5000, avg_cost=28.0, total_budget=0)
+        assert ps.budget_usage_pct(30.0) == 0.0
+
+    def test_serialization_roundtrip(self):
+        ps = PositionSummary(total_shares=8000, avg_cost=27.5, core_shares=2000, total_budget=250000)
+        restored = PositionSummary.from_dict(ps.to_dict())
+        assert restored.total_shares == 8000
+        assert restored.core_shares == 2000
+        assert restored.total_budget == pytest.approx(250000.0)
+
+
+class TestWatcherTarget:
+    def test_is_opportunity_true(self):
+        w = WatcherTarget(code="02800", name="盈富", akshare_code="02800", base_price=80.0)
+        assert w.is_opportunity(78.0) is True
+
+    def test_is_opportunity_exact(self):
+        w = WatcherTarget(code="02800", name="盈富", akshare_code="02800", base_price=80.0)
+        assert w.is_opportunity(80.0) is True
+
+    def test_is_opportunity_false(self):
+        w = WatcherTarget(code="02800", name="盈富", akshare_code="02800", base_price=80.0)
+        assert w.is_opportunity(82.0) is False
+
+    def test_is_opportunity_disabled(self):
+        w = WatcherTarget(code="02800", name="盈富", akshare_code="02800", base_price=80.0, enabled=False)
+        assert w.is_opportunity(75.0) is False
+
+    def test_serialization_roundtrip(self):
+        w = WatcherTarget(code="02800", name="盈富", akshare_code="02800", base_price=80.0, total_budget=100000)
+        restored = WatcherTarget.from_dict(w.to_dict())
+        assert restored.base_price == pytest.approx(80.0)
+        assert restored.total_budget == pytest.approx(100000.0)
+
+
+class TestCheckSellSignalsV2:
+    def test_band_shares_zero_suppresses_sell(self, engine_1336: GridEngine):
+        engine_1336.position_summary = PositionSummary(
+            total_shares=2000, avg_cost=28.0, core_shares=2000
+        )
+        engine_1336.confirm_buy(0, actual_price=28.0)
+        result = engine_1336.check_sell_signals_v2(50.0)
+        assert result == []
+
+    def test_normal_sell_triggers_without_ps(self, engine_1336: GridEngine):
+        engine_1336.position_summary = None
+        h = engine_1336.confirm_buy(0, actual_price=28.0)
+        result = engine_1336.check_sell_signals_v2(28.0 * 1.08)
+        assert len(result) == 1
+        assert result[0].holding_id == h.holding_id
+
+    def test_dy_dampening_raises_threshold(self, engine_1336: GridEngine):
+        engine_1336.position_summary = PositionSummary(total_shares=1000, avg_cost=28.0, core_shares=0)
+        h = engine_1336.confirm_buy(0, actual_price=28.0)
+        # 止盈 7%，钝化后要 12%，以 9% 价格不应触发
+        price_at_9pct = 28.0 * 1.09
+        result = engine_1336.check_sell_signals_v2(price_at_9pct, dy_percentile=85.0)
+        assert result == []
+
+    def test_core_holding_never_sells(self, engine_1336: GridEngine):
+        engine_1336.position_summary = PositionSummary(total_shares=2000, avg_cost=28.0, core_shares=500)
+        h = engine_1336.confirm_buy(0, actual_price=28.0)
+        h.is_core = True
+        result = engine_1336.check_sell_signals_v2(50.0)
+        assert result == []
+
+
+class TestCheckBuySignalV2:
+    def test_pb_fuse_blocks_buy(self, engine_1336: GridEngine):
+        result = engine_1336.check_buy_signal_v2(28.0, pb_percentile=85.0)
+        assert result == []
+
+    def test_pb_below_80_allows_buy(self, engine_1336: GridEngine):
+        # 价格低于所有格子，正常应触发
+        result = engine_1336.check_buy_signal_v2(0.01, pb_percentile=60.0)
+        assert len(result) > 0
+
+
+class TestComputeTotalRiskCapitalV2:
+    def test_uses_budget_formula(self, engine_1336: GridEngine):
+        engine_1336.position_summary = PositionSummary(
+            total_shares=5000, avg_cost=28.0, total_budget=300000
+        )
+        prices = {"01336": 30.0}
+        risk = compute_total_risk_capital_v2({"01336": engine_1336}, prices)
+        # market_value=150000, budget=300000, need=150000
+        assert risk == pytest.approx(150000.0)
+
+    def test_falls_back_to_grid_when_no_budget(self, engine_1336: GridEngine):
+        engine_1336.position_summary = PositionSummary(total_shares=5000, avg_cost=28.0, total_budget=0)
+        prices = {"01336": 30.0}
+        grid_risk = engine_1336.compute_risk_capital()
+        v2_risk = compute_total_risk_capital_v2({"01336": engine_1336}, prices)
+        assert v2_risk == pytest.approx(grid_risk)

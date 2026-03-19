@@ -267,3 +267,109 @@ def compute_dividend_yield(annual_dividend_hkd: float, current_price: float) -> 
     if current_price <= 0:
         return 0.0
     return annual_dividend_hkd / current_price
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.4 估值锁点插件：历史 PB + 股息率分位计算
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def fetch_pb_history(akshare_code: str) -> list[float]:
+    """
+    获取近5-10年历史 PB（市净率）序列，用于估值分位计算。
+    通过百度股市通接口获取，失败时返回空列表。
+    """
+    try:
+        df = ak.stock_hk_valuation_baidu(symbol=akshare_code, indicator="市净率")
+        if df is None or df.empty:
+            return []
+        val_col = df.columns[1]
+        return [float(v) for v in df[val_col].dropna() if float(v) > 0]
+    except Exception as exc:
+        logger.warning("[%s] 获取历史PB失败: %s", akshare_code, exc)
+        return []
+
+
+def fetch_div_yield_history(
+    akshare_code: str,
+    current_price: float,
+    years: int = 10,
+) -> list[float]:
+    """
+    获取近 N 年历史股息率序列（粗估：年度分红 ÷ 当前股价）。
+    数据不足时返回空列表。
+    """
+    if current_price <= 0:
+        return []
+    try:
+        df = ak.stock_hk_dividend_payout_em(symbol=akshare_code)
+        if df is None or df.empty:
+            return []
+        date_col, plan_col = "除净日", "分红方案"
+        if date_col not in df.columns:
+            return []
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        hkd_pattern = re.compile(r"港币(\d+\.?\d*)元")
+        yearly: dict[int, float] = {}
+        for _, row in df.iterrows():
+            dt = row[date_col]
+            if pd.isna(dt):
+                continue
+            year = int(dt.year)
+            m = hkd_pattern.search(str(row.get(plan_col, "")))
+            if m:
+                yearly[year] = yearly.get(year, 0.0) + float(m.group(1))
+        cutoff_year = datetime.now().year - years
+        return [
+            div / current_price
+            for year, div in yearly.items()
+            if year >= cutoff_year and div > 0
+        ]
+    except Exception as exc:
+        logger.warning("[%s] 获取历史股息率失败: %s", akshare_code, exc)
+        return []
+
+
+def compute_percentile(
+    current: float,
+    history: list[float],
+    higher_is_better: bool = False,
+) -> float:
+    """
+    计算 current 在 history 中的百分位（0-100）。数据不足（< 4 个）时返回 -1。
+    higher_is_better=True（股息率）：current 越高 → 分位越高 → 越低估。
+    higher_is_better=False（PB）：current 越低 → 分位越高 → 越低估。
+    """
+    valid = [v for v in history if v > 0]
+    if len(valid) < 4:
+        return -1.0
+    if higher_is_better:
+        count = sum(1 for v in valid if v <= current)
+    else:
+        count = sum(1 for v in valid if v >= current)
+    return round(count / len(valid) * 100, 1)
+
+
+def get_valuation_label(
+    percentile: float,
+    metric_name: str,
+    current_val: float,
+    unit: str = "%",
+    years: int = 10,
+) -> str:
+    """生成估值分位文本标签（含 emoji 和中文描述）。"""
+    if percentile < 0:
+        return f"{metric_name}: {current_val:.2f}{unit} (历史数据不足)"
+    if percentile >= 90:
+        emoji, desc = "🚀", "极度低估"
+    elif percentile >= 75:
+        emoji, desc = "📈", "低估"
+    elif percentile >= 50:
+        emoji, desc = "⚖️", "合理"
+    elif percentile >= 25:
+        emoji, desc = "📉", "偏高"
+    else:
+        emoji, desc = "🔴", "高估"
+    return (
+        f"{metric_name}: {current_val:.2f}{unit} "
+        f"({years}年分位: {percentile:.0f}% {emoji} {desc})"
+    )

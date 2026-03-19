@@ -107,3 +107,19 @@ class BarkNotifier:
         )
         callback_url = f"{self.web_server_url}?action=risk_warning"
         return self._send(title, body, url=callback_url, group="ValueShield-Risk")
+
+    def notify_watcher(
+        self,
+        code: str,
+        name: str,
+        current_price: float,
+        base_price: float,
+    ) -> bool:
+        """发送观察者建仓机会提醒（现价 ≤ 建仓价时触发）。"""
+        title = f"[建仓机会] {name}"
+        body = (
+            f"现价 {current_price:.3f} HKD 已到达安全边际价 {base_price:.3f} HKD\n"
+            f"可考虑建立初始仓位"
+        )
+        callback_url = f"{self.web_server_url}?action=watcher_buy&code={code}"
+        return self._send(title, body, url=callback_url, group="ValueShield-Watch")

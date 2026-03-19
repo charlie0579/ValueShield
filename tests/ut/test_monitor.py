@@ -346,3 +346,84 @@ class TestRunOnceMinHolding:
                     run_once(sample_config, sample_state, engines, notifier_mock)
 
         notifier_mock.notify_sell.assert_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.4 新增：build_watchers / v2 风险 / 观察者通知
+# ─────────────────────────────────────────────────────────────────────────────
+from monitor import build_watchers
+from engine import PositionSummary, WatcherTarget
+
+
+class TestBuildWatchers:
+    def test_build_from_config(self, sample_config):
+        sample_config["watchers"] = [
+            {"code": "02800", "name": "盈富基金", "akshare_code": "02800",
+             "base_price": 80.0, "total_budget": 100000.0, "enabled": True}
+        ]
+        result = build_watchers(sample_config)
+        assert len(result) == 1
+        assert result[0].code == "02800"
+        assert result[0].base_price == pytest.approx(80.0)
+
+    def test_disabled_watcher_excluded(self, sample_config):
+        sample_config["watchers"] = [
+            {"code": "02800", "name": "盈富", "akshare_code": "02800",
+             "base_price": 80.0, "enabled": False}
+        ]
+        result = build_watchers(sample_config)
+        assert result == []
+
+    def test_no_watchers_key(self, sample_config):
+        sample_config.pop("watchers", None)
+        result = build_watchers(sample_config)
+        assert result == []
+
+
+class TestBuildEnginesLoadsPositionSummary:
+    def test_loads_ps_from_state(self, sample_config, sample_state):
+        """state.json 中有 position_summary 时，应正确加载到引擎。"""
+        ps_data = {"total_shares": 5000, "avg_cost": 28.0, "core_shares": 1000, "total_budget": 200000.0}
+        sample_state.setdefault("positions", {}).setdefault("01336", {})["position_summary"] = ps_data
+        engines = build_engines(sample_config, sample_state)
+        ps = engines["01336"].position_summary
+        assert ps is not None
+        assert ps.total_shares == 5000
+        assert ps.core_shares == 1000
+
+    def test_initializes_ps_from_config_budget(self, sample_config, sample_state):
+        """config 中有 total_budget 时，若无 state ps，应用 config 预算初始化。"""
+        sample_config["stocks"][0]["total_budget"] = 250000.0
+        # state 中无 position_summary
+        sample_state.get("positions", {}).pop("01336", None)
+        engines = build_engines(sample_config, sample_state)
+        ps = engines["01336"].position_summary
+        assert ps is not None
+        assert ps.total_budget == pytest.approx(250000.0)
+
+
+class TestRunOnceWatcherNotification:
+    def test_watcher_opportunity_triggers_notify(self, sample_config, sample_state):
+        """现价 <= 建仓价时应调用 notify_watcher。"""
+        sample_config["watchers"] = [
+            {"code": "02800", "name": "盈富", "akshare_code": "02800",
+             "base_price": 80.0, "enabled": True}
+        ]
+        engines = build_engines(sample_config, sample_state)
+        notifier_mock = MagicMock()
+        notifier_mock.notify_buy.return_value = True
+        notifier_mock.notify_sell.return_value = True
+        notifier_mock.notify_risk_warning.return_value = True
+        notifier_mock.notify_watcher.return_value = True
+
+        def fake_price(code):
+            return 78.0 if code == "02800" else 30.0
+
+        with patch("monitor.fetch_realtime_price", side_effect=fake_price):
+            with patch("monitor.fetch_dividend_ttm", return_value=1.8):
+                with patch("monitor.compute_dividend_yield", return_value=0.065):
+                    run_once(sample_config, sample_state, engines, notifier_mock)
+
+        notifier_mock.notify_watcher.assert_called_once_with(
+            code="02800", name="盈富", current_price=78.0, base_price=80.0
+        )

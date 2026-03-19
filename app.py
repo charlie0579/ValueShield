@@ -1,6 +1,6 @@
 """
-app.py - ValueShield v1.8
-Bug 修复：session_state 冲突 · 底仓逻辑对齐 · 同步反馈 · 最后更新显示
+app.py - ValueShield v2.4
+价値投资管家：总仓位管理 + 历史估值分位 + 观察者模式 + 同花顺风格 UI
 """
 
 import json
@@ -15,9 +15,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-from engine import GridEngine, compute_total_risk_capital, check_cash_warning
-from crawler import fetch_realtime_price, fetch_dividend_ttm, compute_dividend_yield
-from monitor import load_config, load_state, save_state, build_engines
+from engine import (
+    GridEngine,
+    PositionSummary,
+    WatcherTarget,
+    compute_total_risk_capital,
+    compute_total_risk_capital_v2,
+    check_cash_warning,
+)
+from crawler import (
+    fetch_realtime_price,
+    fetch_dividend_ttm,
+    compute_dividend_yield,
+    compute_percentile,
+    fetch_div_yield_history,
+    fetch_pb_history,
+    get_valuation_label,
+)
+from monitor import load_config, load_state, save_state, build_engines, build_watchers
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -70,6 +85,36 @@ html, body, [data-testid="stAppViewContainer"] {
     background: #EFF6FF; border: 1px solid #BFDBFE; color: #1D4ED8;
     border-radius: 6px; padding: 2px 8px; font-size: 0.72rem;
     font-weight: 700; display: inline-block; margin-bottom: 4px;
+}
+/* v2.4 观察者卡片 */
+.lv-watcher-card {
+    background: linear-gradient(135deg, #F0FDF4 0%, #ECFDF5 100%);
+    border-radius: 14px;
+    border: 1px solid #BBF7D0;
+    padding: 18px 22px;
+    margin-bottom: 12px;
+}
+/* v2.4 估值分位标签 */
+.lv-val-badge {
+    display: inline-block; padding: 3px 10px;
+    border-radius: 8px; font-size: 0.76rem; font-weight: 600;
+    margin: 2px 4px 2px 0;
+}
+.lv-val-badge.underval  { background: #ECFDF5; color: #065F46; border: 1px solid #6EE7B7; }
+.lv-val-badge.overval   { background: #FEF2F2; color: #991B1B; border: 1px solid #FCA5A5; }
+.lv-val-badge.neutral   { background: #F9FAFB; color: #374151; border: 1px solid #E5E7EB; }
+/* v2.4 仓位占比条 */
+.lv-band-info {
+    font-size: 0.78rem; color: #6B7280;
+    background: #F9FAFB; border-radius: 6px;
+    padding: 5px 10px; margin-top: 4px;
+    display: inline-block;
+}
+/* 侧边栏分组标题 */
+.sb-group-title {
+    font-size: 0.65rem; font-weight: 700; color: #6B7280;
+    text-transform: uppercase; letter-spacing: 0.1em;
+    padding: 8px 14px 4px; margin-top: 6px;
 }
 .lv-price    { font-size: 2.8rem; font-weight: 800; color: #111827; letter-spacing: -0.04em; line-height: 1.1; }
 .lv-divyield { font-size: 1.4rem; font-weight: 700; }
@@ -146,43 +191,85 @@ def compute_portfolio_stats(engines: dict, state: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_sidebar(config: dict, state: dict) -> str:
+    """
+    v2.4 双分组侧边栏：
+    📊 当前持仓 (N) — 已有仓位的标的
+    🔍 观察名单 (M) — 零持仓监控标的
+    """
     stocks = [s for s in config["stocks"] if s.get("enabled", True)]
-    if not stocks:
-        return ""
+    watchers = config.get("watchers", [])
     pending_all = state.get("pending_confirmations", [])
+
+    # 初始化 selected_code
+    valid_codes = {s["code"] for s in stocks} | {f"watch_{w['code']}" for w in watchers}
+    if "selected_code" not in st.session_state or st.session_state["selected_code"] not in valid_codes:
+        st.session_state["selected_code"] = stocks[0]["code"] if stocks else ""
 
     with st.sidebar:
         st.markdown(
             '<div style="padding:16px 12px 8px;">'
             '<div style="font-size:1.1rem;font-weight:800;color:#111827;">🛡️ ValueShield</div>'
-            '<div style="font-size:0.65rem;color:#9CA3AF;margin-top:2px;">H股网格价值投资</div>'
+            '<div style="font-size:0.65rem;color:#9CA3AF;margin-top:2px;">v2.4 · 价值投资管家</div>'
             '</div>',
             unsafe_allow_html=True,
         )
         st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
 
-        search = st.text_input(
-            "搜索", placeholder="🔍 搜索名称/代码",
-            label_visibility="collapsed", key="sidebar_search",
+        # ── 📊 当前持仓
+        st.markdown(
+            f'<div class="sb-group-title">📊 当前持仓 ({len(stocks)})</div>',
+            unsafe_allow_html=True,
         )
-        filtered = [
-            s for s in stocks
-            if not search or search.lower() in s["name"].lower() or search in s["code"]
-        ]
-
-        all_codes = {s["code"] for s in stocks}
-        if "selected_code" not in st.session_state or st.session_state["selected_code"] not in all_codes:
-            st.session_state["selected_code"] = stocks[0]["code"]
-
-        for s in filtered:
+        for s in stocks:
             code = s["code"]
             name = s["name"]
+            price = state.get("latest_prices", {}).get(code)
             n_pend = sum(1 for p in pending_all if p.get("code") == code)
             badge = f"  🔔{n_pend}" if n_pend else ""
+            # 浮盈色
+            ps_data = state.get("positions", {}).get(code, {}).get("position_summary")
+            if ps_data and price:
+                ps = PositionSummary.from_dict(ps_data)
+                pnl_pct = ps.unrealized_pnl_pct(price) * 100
+                pnl_str = f" {pnl_pct:+.1f}%"
+            else:
+                pnl_str = f" {price:.2f}" if price else ""
             is_sel = st.session_state["selected_code"] == code
             arrow = "▶ " if is_sel else "   "
-            if st.button(f"{arrow}{name}{badge}\n        {code}.HK", key=f"nav_{code}"):
+            if st.button(
+                f"{arrow}{name}{badge}\n        {code}.HK{pnl_str}",
+                key=f"nav_{code}",
+            ):
                 st.session_state["selected_code"] = code
+                st.rerun()
+
+        st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
+
+        # ── 🔍 观察名单
+        st.markdown(
+            f'<div class="sb-group-title">🔍 观察名单 ({len(watchers)})</div>',
+            unsafe_allow_html=True,
+        )
+        for w in watchers:
+            code = w["code"]
+            name = w["name"]
+            base = w.get("base_price", 0.0)
+            w_price = state.get("watcher_prices", {}).get(code)
+            if w_price and base:
+                dist_pct = (w_price - base) / base * 100
+                dist_str = f" {dist_pct:+.1f}%"
+                status = "🟢 已达" if w_price <= base else f"⏳ 距{dist_pct:+.1f}%"
+            else:
+                dist_str = ""
+                status = "⏳ 等待"
+            sel_key = f"watch_{code}"
+            is_sel = st.session_state["selected_code"] == sel_key
+            arrow = "▶ " if is_sel else "   "
+            if st.button(
+                f"{arrow}👁 {name}\n        {code}.HK · {status}",
+                key=f"nav_w_{code}",
+            ):
+                st.session_state["selected_code"] = sel_key
                 st.rerun()
 
         st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
@@ -311,10 +398,15 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     state = load_state()
     settings = config["settings"]
     engines = build_engines(config, state)
+    watchers = build_watchers(config)
 
     selected_code = render_sidebar(config, state)
 
-    total_risk = compute_total_risk_capital(engines)
+    # v2.4 风险计算：优先使用预算公式，退化用网格压力测试
+    current_prices = state.get("latest_prices", {})
+    total_risk = compute_total_risk_capital_v2(engines, current_prices)
+    if total_risk == 0.0:
+        total_risk = compute_total_risk_capital(engines)
     cash_reserve = settings["cash_reserve"]
     n_pending_all = len(state.get("pending_confirmations", []))
     total_holdings = sum(len(e.active_holdings()) for e in engines.values())
@@ -354,6 +446,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     _hr()
 
+    # ── v2.4：观察者卡片路由
+    if selected_code.startswith("watch_"):
+        watch_code = selected_code[6:]
+        watcher_cfg = next((w for w in config.get("watchers", []) if w["code"] == watch_code), None)
+        if watcher_cfg:
+            _render_watcher_card(watcher_cfg, state, config, engines)
+        return
+
     stock_cfg = next((s for s in config["stocks"] if s["code"] == selected_code), None)
     if not stock_cfg:
         st.warning("未找到选中标的配置。")
@@ -365,6 +465,15 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     current_price = state.get("latest_prices", {}).get(code)
     annual_div = state.get("latest_dividend_ttm", {}).get(code, stock_cfg.get("annual_dividend_hkd", 0.0))
     div_yield = compute_dividend_yield(annual_div, current_price) if current_price else 0.0
+
+    # v2.4 估值分位（从缓存读取，不在 UI 层实时抓取）
+    val_hist = state.get("valuation_history", {}).get(code, {})
+    dy_hist = val_hist.get("div_yield", [])
+    pb_hist = val_hist.get("pb", [])
+    dy_pct = compute_percentile(div_yield, dy_hist, higher_is_better=True)
+    pb_pct = compute_percentile(0.0, pb_hist, higher_is_better=False)  # PB 值由监控层填充
+    dy_label = get_valuation_label(dy_pct, "股息率", div_yield * 100, unit="%")
+    pb_label = get_valuation_label(pb_pct, "PB", 0.0, unit="x") if pb_hist else ""
 
     # ── 标签页
     tab_monitor, tab_config, tab_settings = st.tabs(["📊 实时监控", "⚙️ 网格配置", "🛠️ 系统设置"])
@@ -463,9 +572,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
         _hr()
 
-        # ── 同花顺风格持仓看板
-        stock_hdr_col, refresh_btn_col = st.columns([8, 1])
-        with stock_hdr_col:
+        # ── v2.4 总仓位摘要卡片（同花顺风格）
+        ps = engine.position_summary
+        with st.container():
             st.markdown(
                 f'<span class="lv-badge">{code}.HK</span>'
                 f' <span style="font-size:1.15rem;font-weight:800;color:#111827;">{name}</span>'
@@ -473,6 +582,71 @@ def main() -> None:  # noqa: PLR0912, PLR0915
                 f'Step {engine.step:.3f} · {engine.grid_levels} 格</span>',
                 unsafe_allow_html=True,
             )
+
+        # 估值分位标签（若有历史数据）
+        if dy_label:
+            val_cls = "underval" if dy_pct >= 75 else ("overval" if dy_pct >= 0 and dy_pct < 25 else "neutral")
+            st.markdown(
+                f'<span class="lv-val-badge {val_cls}">{dy_label}</span>'
+                + (f'<span class="lv-val-badge neutral">{pb_label}</span>' if pb_label else ""),
+                unsafe_allow_html=True,
+            )
+
+        # PositionSummary 摘要行
+        if ps is not None and ps.total_shares > 0:
+            pnl_val = ps.unrealized_pnl(current_price) if current_price else 0.0
+            pnl_pct = ps.unrealized_pnl_pct(current_price) * 100 if current_price else 0.0
+            pnl_color = "#16A34A" if pnl_val >= 0 else "#DC2626"
+            ps_c1, ps_c2, ps_c3, ps_c4, ps_c5 = st.columns(5)
+            with ps_c1:
+                with st.container(border=True):
+                    st.caption("总持股")
+                    st.markdown(f'<div style="font-size:1.3rem;font-weight:700;">{ps.total_shares:,}</div><div style="font-size:0.7rem;color:#9CA3AF;">底仓 {ps.core_shares:,} | 波段 {ps.band_shares:,}</div>', unsafe_allow_html=True)
+            with ps_c2:
+                with st.container(border=True):
+                    st.caption("均价")
+                    st.markdown(f'<div style="font-size:1.3rem;font-weight:700;">{ps.avg_cost:.3f}</div><div style="font-size:0.7rem;color:#9CA3AF;">HKD</div>', unsafe_allow_html=True)
+            with ps_c3:
+                with st.container(border=True):
+                    st.caption("现价")
+                    price_str = f"{current_price:.3f}" if current_price else "--"
+                    st.markdown(f'<div style="font-size:1.3rem;font-weight:700;">{price_str}</div><div style="font-size:0.7rem;color:#9CA3AF;">HKD</div>', unsafe_allow_html=True)
+            with ps_c4:
+                with st.container(border=True):
+                    st.caption("浮盈")
+                    st.markdown(
+                        f'<div style="font-size:1.3rem;font-weight:700;color:{pnl_color};">{pnl_val:+,.0f}</div>'
+                        f'<div style="font-size:0.7rem;color:{pnl_color};">{pnl_pct:+.2f}%</div>',
+                        unsafe_allow_html=True,
+                    )
+            with ps_c5:
+                with st.container(border=True):
+                    st.caption("市值")
+                    mv = ps.market_value(current_price) if current_price else ps.cost_value
+                    st.markdown(f'<div style="font-size:1.3rem;font-weight:700;">{mv:,.0f}</div><div style="font-size:0.7rem;color:#9CA3AF;">HKD</div>', unsafe_allow_html=True)
+
+            # 预算进度条
+            if ps.total_budget > 0:
+                usage = ps.budget_usage_pct(current_price or ps.avg_cost)
+                risk_need = ps.risk_capital_needed(current_price or 0)
+                st.progress(
+                    usage,
+                    text=(
+                        f"📊 预算进度：已投 {ps.cost_value:,.0f} / 总预算 {ps.total_budget:,.0f} HKD"
+                        f"  ({usage * 100:.1f}%)  · 剩余风险资金需求 {risk_need:,.0f} HKD"
+                    ),
+                )
+
+            # 波段仓位为 0 时显示提示
+            if ps.band_shares == 0:
+                st.info("🏠 波段仓位已清空，系统已屏蔽全部卖出提醒（底仓保护模式）。")
+
+        _hr()
+
+        # ── 同花顺风格持仓看板
+        stock_hdr_col, refresh_btn_col = st.columns([8, 1])
+        with stock_hdr_col:
+            pass  # 标题已在上方显示
         with refresh_btn_col:
             if st.button("📡 刷新", key=f"fetch_{code}"):
                 _fetch_price_cached.clear()
@@ -621,6 +795,47 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # ⚙️ 配置页
     # ════════════════════════════════════════════════════════════════
     with tab_config:
+        # ── v2.4 一键对齐账户：总仓位简化录入
+        with st.expander("👤 一键对齐账户（v2.4 总持仓录入）", expanded=(engine.position_summary is None)):
+            st.caption("输入券商账户中的实际持仓数据，系统将据此计算浮盈、预算进度和波段仓位。底仓股数不触发止盈。")
+            ps_cur = engine.position_summary or PositionSummary()
+            ac1, ac2, ac3, ac4 = st.columns(4)
+            with ac1:
+                new_total_shares = st.number_input(
+                    "总持有股数", min_value=0, step=100, key=f"ps_total_{code}",
+                    value=ps_cur.total_shares,
+                )
+            with ac2:
+                new_avg_cost = st.number_input(
+                    "平均成本价 (HKD)", min_value=0.0, step=0.01, format="%.4f",
+                    key=f"ps_cost_{code}", value=ps_cur.avg_cost,
+                )
+            with ac3:
+                new_core = st.number_input(
+                    "底仓锁定股数", min_value=0, step=100, key=f"ps_core_{code}",
+                    value=ps_cur.core_shares,
+                    help="底仓为长线烟蒂核心仓，系统严禁触发卖出提醒",
+                )
+            with ac4:
+                new_budget = st.number_input(
+                    "计划总投入 (HKD)", min_value=0.0, step=10000.0, format="%.0f",
+                    key=f"ps_budget_{code}",
+                    value=ps_cur.total_budget or float(stock_cfg.get("total_budget", 0)),
+                )
+            if st.button("✅ 同步账户", key=f"ps_sync_{code}", type="primary"):
+                engine.position_summary = PositionSummary(
+                    total_shares=int(new_total_shares),
+                    avg_cost=float(new_avg_cost),
+                    core_shares=int(new_core),
+                    total_budget=float(new_budget),
+                )
+                state.setdefault("positions", {})[code] = engine.to_state_dict()
+                save_state(state)
+                st.toast(f"✅ {name} 账户已同步：{new_total_shares:,} 股 · 均价 {new_avg_cost:.3f} · 底仓 {new_core:,}")
+                st.rerun()
+
+        _hr()
+
         # ── 标题行：显示 Base/Step + 实时市价参考
         mkt_ref = (
             f"市场现价 <b style='color:#2563EB'>{current_price:.3f}</b> HKD · "
@@ -796,9 +1011,109 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     st.markdown(
         '<div style="text-align:center;color:#E5E7EB;font-size:0.6rem;padding:20px 0 6px;">'
-        'ValueShield v1.8 · 算法为辅，主观为主</div>',
+        'ValueShield v2.4 · 价值投资管家 · 算法为辅，主观为主</div>',
         unsafe_allow_html=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.4 观察者卡片渲染
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_watcher_card(watcher_cfg: dict, state: dict, config: dict, engines: dict) -> None:
+    """渲染零持仓观察者卡片：展示建仓价、当前价、距离、预算。"""
+    code = watcher_cfg["code"]
+    name = watcher_cfg["name"]
+    base_price = watcher_cfg.get("base_price", 0.0)
+    total_budget = watcher_cfg.get("total_budget", 0.0)
+    w_price = state.get("watcher_prices", {}).get(code)
+
+    st.markdown(
+        f'<span class="lv-badge">{code}.HK</span>'
+        f' <span style="font-size:1.15rem;font-weight:800;color:#111827;">👁 {name}</span>'
+        f'<span style="font-size:0.72rem;color:#6B7280;margin-left:10px;">观察名单</span>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        with st.container(border=True):
+            st.caption("建仓价（安全边际）")
+            st.markdown(f'<div style="font-size:1.6rem;font-weight:700;color:#2563EB;">{base_price:.3f}</div><div style="font-size:0.7rem;color:#9CA3AF;">HKD</div>', unsafe_allow_html=True)
+    with c2:
+        with st.container(border=True):
+            st.caption("当前价")
+            if w_price:
+                color = "#16A34A" if w_price <= base_price else "#111827"
+                pct = (w_price - base_price) / base_price * 100
+                st.markdown(f'<div style="font-size:1.6rem;font-weight:700;color:{color};">{w_price:.3f}</div><div style="font-size:0.7rem;color:#9CA3AF;">{pct:+.1f}% 距建仓价</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div style="font-size:1.6rem;font-weight:700;color:#9CA3AF;">--</div><div style="font-size:0.7rem;color:#9CA3AF;">未同步</div>', unsafe_allow_html=True)
+    with c3:
+        with st.container(border=True):
+            st.caption("计划投入")
+            budget_str = f"{total_budget:,.0f}" if total_budget > 0 else "--"
+            st.markdown(f'<div style="font-size:1.6rem;font-weight:700;color:#374151;">{budget_str}</div><div style="font-size:0.7rem;color:#9CA3AF;">HKD</div>', unsafe_allow_html=True)
+
+    if w_price and w_price <= base_price:
+        st.success(f"🟢 {name} 已到达安全边际！建仓价 {base_price:.3f} HKD，现价 {w_price:.3f} HKD")
+    elif w_price:
+        need_drop = w_price - base_price
+        st.info(f"⏳ 距建仓价还需下跌 {need_drop:.3f} HKD ({(need_drop/w_price*100):.1f}%)")
+
+    _hr()
+
+    # 刷新价格
+    if st.button("📡 刷新价格", key=f"fetch_watcher_{code}"):
+        _fetch_price_cached.clear()
+        with st.spinner("数据同步中..."):
+            new_price = _fetch_price_cached(watcher_cfg.get("akshare_code", code))
+        if new_price:
+            state.setdefault("watcher_prices", {})[code] = new_price
+            save_state(state)
+            st.toast(f"✅ {name} 现价 {new_price:.3f} HKD")
+            st.rerun()
+
+    _hr()
+
+    # 一键转正（首次买入录入后移出观察名单）
+    with st.expander("➕ 记录首笔买入（转入持仓）"):
+        st.caption("录入首笔买入后，该标的将自动移入持仓名单。")
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            buy_price_in = st.number_input("买入价 (HKD)", min_value=0.001, step=0.01, format="%.3f", key=f"w_buy_price_{code}")
+        with f2:
+            buy_shares_in = st.number_input("买入股数", min_value=100, step=100, key=f"w_buy_shares_{code}")
+        with f3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("✅ 确认建仓", key=f"w_confirm_{code}"):
+                # 将观察者转化为持仓标的（写入 config）
+                new_stock = {
+                    "code": code,
+                    "name": name,
+                    "exchange": "HK",
+                    "akshare_code": watcher_cfg.get("akshare_code", code),
+                    "base_price": buy_price_in,
+                    "hist_min": buy_price_in * 0.5,
+                    "lot_size": int(buy_shares_in),
+                    "step": None,
+                    "take_profit_pct": 0.07,
+                    "enabled": True,
+                    "annual_dividend_hkd": 0.0,
+                    "total_budget": total_budget,
+                }
+                config["stocks"].append(new_stock)
+                # 移除观察者
+                config["watchers"] = [w for w in config.get("watchers", []) if w["code"] != code]
+                save_config(config)
+                # 初始化 position_summary
+                from engine import PositionSummary as PS
+                ps_new = PS(total_shares=int(buy_shares_in), avg_cost=float(buy_price_in), core_shares=0, total_budget=total_budget)
+                state.setdefault("positions", {})[code] = {"grid_occupied": {}, "holdings": [], "position_summary": ps_new.to_dict()}
+                save_state(state)
+                st.session_state["selected_code"] = code
+                st.toast(f"✅ {name} 已从观察名单移入持仓！")
+                st.rerun()
 
 
 if __name__ == "__main__":

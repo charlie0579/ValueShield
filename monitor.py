@@ -12,8 +12,20 @@ from datetime import datetime, date
 
 import chinese_calendar as cc
 
-from crawler import fetch_realtime_price, fetch_dividend_ttm, compute_dividend_yield
-from engine import GridEngine, compute_total_risk_capital, check_cash_warning
+from crawler import (
+    fetch_realtime_price,
+    fetch_dividend_ttm,
+    compute_dividend_yield,
+    compute_percentile,
+)
+from engine import (
+    GridEngine,
+    PositionSummary,
+    WatcherTarget,
+    compute_total_risk_capital,
+    compute_total_risk_capital_v2,
+    check_cash_warning,
+)
 from notifier import BarkNotifier
 
 logger = logging.getLogger(__name__)
@@ -39,7 +51,14 @@ def load_config() -> dict:
 
 def load_state() -> dict:
     if not os.path.exists(STATE_PATH):
-        return {"positions": {}, "latest_prices": {}, "latest_dividend_ttm": {}, "alerts": []}
+        return {
+            "positions": {},
+            "latest_prices": {},
+            "latest_dividend_ttm": {},
+            "valuation_history": {},   # {code: {"pb": [...], "div_yield": [...]}}
+            "watcher_prices": {},      # 观察标的最新价格
+            "alerts": [],
+        }
     with open(STATE_PATH, encoding="utf-8") as fp:
         return json.load(fp)
 
@@ -72,7 +91,7 @@ def is_in_trading_session(now: datetime) -> bool:
 
 
 def build_engines(config: dict, state: dict) -> dict[str, GridEngine]:
-    """根据配置和持久化状态初始化所有网格引擎。"""
+    """根据配置和持久化状态初始化所有网格引擎（含 v2.4 总仓摘要）。"""
     engines: dict[str, GridEngine] = {}
     settings = config["settings"]
     for stock in config["stocks"]:
@@ -91,8 +110,49 @@ def build_engines(config: dict, state: dict) -> dict[str, GridEngine]:
         )
         pos = state.get("positions", {}).get(code, {})
         engine.sync_state(pos)
+        # 若配置中指定了 total_budget，且 state 中尚无 position_summary ，则用配置初始化
+        if engine.position_summary is None and stock.get("total_budget", 0) > 0:
+            engine.position_summary = PositionSummary(
+                total_budget=float(stock["total_budget"]),
+            )
         engines[code] = engine
     return engines
+
+
+def build_watchers(config: dict) -> list[WatcherTarget]:
+    """从配置构建观察者标的列表。"""
+    return [
+        WatcherTarget.from_dict(w)
+        for w in config.get("watchers", [])
+        if w.get("enabled", True)
+    ]
+
+
+def refresh_valuation_history(config: dict, state: dict) -> dict:
+    """
+    刷新历史估值数据（PB / 股息率序列）并写入 state。
+    供 UI 层手动触发（‘刷新估值数据’按鈕），不在主监控循环中调用。
+    """
+    from crawler import fetch_div_yield_history, fetch_pb_history
+    current_prices = state.get("latest_prices", {})
+    for stock in config.get("stocks", []):
+        if not stock.get("enabled", True):
+            continue
+        code = stock["code"]
+        akcode = stock["akshare_code"]
+        price = current_prices.get(code, 0.0)
+        if price <= 0:
+            continue
+        val_hist = state.setdefault("valuation_history", {}).setdefault(code, {})
+        dy_hist = fetch_div_yield_history(akcode, price)
+        if dy_hist:
+            val_hist["div_yield"] = dy_hist
+        pb_hist = fetch_pb_history(akcode)
+        if pb_hist:
+            val_hist["pb"] = pb_hist
+        logger.info("[%s] 历史估值数据已刷新: DY %d 条，PB %d 条", code, len(dy_hist), len(pb_hist))
+    return state
+
 
 
 def _add_pending(state: dict, entry: dict) -> None:
@@ -112,11 +172,12 @@ def _add_pending(state: dict, entry: dict) -> None:
 
 def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier: BarkNotifier) -> dict:
     """
-    单次轮询：获取行情 → 检测信号 → 推送通知 → 更新状态。
+    单次轮询：获取行情 → v2.4 检测信号 → 推送通知 → 更新状态。
     返回更新后的 state。
     """
     settings = config["settings"]
     cash_reserve = settings["cash_reserve"]
+    current_prices: dict[str, float] = {}
 
     for stock in config["stocks"]:
         if not stock.get("enabled", True):
@@ -129,6 +190,7 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
         if price is None:
             logger.warning("[%s] 获取价格失败，跳过本轮", code)
             continue
+        current_prices[code] = price
 
         annual_div = state.get("latest_dividend_ttm", {}).get(code)
         if annual_div is None:
@@ -140,7 +202,15 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
         div_yield = compute_dividend_yield(annual_div, price)
         state.setdefault("latest_prices", {})[code] = price
 
-        buy_levels = engine.check_buy_signal(price)
+        # ── 估值分位（仅读 state 缓存，不实时抓取；历史数据由 refresh_valuation_history 填充）
+        val_hist = state.get("valuation_history", {}).get(code, {})
+        dy_hist = val_hist.get("div_yield", [])
+        # PB 分位需实时 PB 值，监控层无此数据，固定 -1 跳过熔断
+        pb_pct = -1.0
+        dy_pct = compute_percentile(div_yield, dy_hist, higher_is_better=True)
+
+        # ── v2.4 买入信号（PB > 80% 分位时熔断）
+        buy_levels = engine.check_buy_signal_v2(price, pb_percentile=pb_pct)
         for level in buy_levels:
             grid_prices = engine.grid_prices()
             notifier.notify_buy(
@@ -164,7 +234,12 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
             })
             logger.info("[%s] 推送买入信号 第%d格 价格=%.4f", code, level + 1, grid_prices[level])
 
-        sell_holdings = engine.check_sell_signals(price, min_holding_limit=int(settings.get("min_holding_limit", 0)))
+        # ── v2.4 卖出信号（band_shares==0 屏蔽；min_holding_limit 底仓保护 v1 兼容；股息率>80% 钝化）
+        sell_holdings = engine.check_sell_signals_v2(
+            price,
+            dy_percentile=dy_pct,
+            min_holding_limit=int(settings.get("min_holding_limit", 0)),
+        )
         for holding in sell_holdings:
             notifier.notify_sell(
                 code=code,
@@ -193,13 +268,32 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
 
         state.setdefault("positions", {})[code] = engine.to_state_dict()
 
-    total_risk = compute_total_risk_capital(engines)
+    # ── 观察者模式检查
+    for watcher in build_watchers(config):
+        w_price = fetch_realtime_price(watcher.akshare_code)
+        if w_price is not None:
+            state.setdefault("watcher_prices", {})[watcher.code] = w_price
+            if watcher.is_opportunity(w_price):
+                notifier.notify_watcher(
+                    code=watcher.code,
+                    name=watcher.name,
+                    current_price=w_price,
+                    base_price=watcher.base_price,
+                )
+                logger.info("[%s] 观察者建仓机会：现价=%.3f <= 建仓价=%.3f", watcher.code, w_price, watcher.base_price)
+
+    # ── v2.4 风险预警（按预算公式）
+    total_risk = compute_total_risk_capital_v2(engines, current_prices)
+    if total_risk == 0.0:  # 如果无预算数据，退化为旧网格方式
+        total_risk = compute_total_risk_capital(engines)
     if check_cash_warning(total_risk, cash_reserve):
         risk_details = [
             {
                 "code": s["code"],
                 "name": s["name"],
-                "risk": engines[s["code"]].compute_risk_capital(),
+                "risk": engines[s["code"]].compute_risk_capital_v2(
+                    current_prices.get(s["code"], 0.0)
+                ),
             }
             for s in config["stocks"]
             if s.get("enabled", True) and s["code"] in engines
