@@ -23,3 +23,4 @@ state.json
 # 日志
 *.log
 monitor.log
+.github/

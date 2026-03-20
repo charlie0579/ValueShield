@@ -226,3 +226,53 @@ class TestNotifyRiskWarning:
         payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
         assert "新华保险" in payload["body"]
         assert "广深铁路" in payload["body"]
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# notify_watcher
+# ─────────────────────────────────────────────────────────────────────────────
+class TestNotifyWatcher:
+    def test_title_contains_stock_name(self, notifier: BarkNotifier):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            result = notifier.notify_watcher(
+                code="02800", name="盈富基金",
+                current_price=78.5, base_price=80.0,
+            )
+        assert result is True
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert "盈富基金" in payload["title"]
+
+    def test_body_shows_prices(self, notifier: BarkNotifier):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            notifier.notify_watcher(
+                code="02800", name="盈富基金",
+                current_price=78.5, base_price=80.0,
+            )
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert "78.500" in payload["body"]
+        assert "80.000" in payload["body"]
+
+    def test_group_is_watcher(self, notifier: BarkNotifier):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        with patch("requests.post", return_value=mock_resp) as mock_post:
+            notifier.notify_watcher(
+                code="02800", name="盈富基金",
+                current_price=78.5, base_price=80.0,
+            )
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload.get("group") == "ValueShield-Watch"
+
+    def test_silent_when_no_token(self, notifier_no_token: BarkNotifier):
+        with patch("requests.post") as mock_post:
+            result = notifier_no_token.notify_watcher(
+                code="02800", name="盈富基金",
+                current_price=78.5, base_price=80.0,
+            )
+        mock_post.assert_not_called()
+        assert result is False

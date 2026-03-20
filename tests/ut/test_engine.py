@@ -719,3 +719,48 @@ class TestComputeTotalRiskCapitalV2:
         grid_risk = engine_1336.compute_risk_capital()
         v2_risk = compute_total_risk_capital_v2({"01336": engine_1336}, prices)
         assert v2_risk == pytest.approx(grid_risk)
+
+
+    def test_unrealized_pnl_pct_zero_avg_cost(self):
+        ps = PositionSummary(total_shares=5000, avg_cost=0.0)
+        assert ps.unrealized_pnl_pct(30.0) == 0.0
+
+    def test_risk_capital_needed_zero_price(self):
+        ps = PositionSummary(total_shares=5000, avg_cost=28.0, total_budget=300000)
+        assert ps.risk_capital_needed(0.0) == 0.0
+
+
+class TestComputeTotalRiskCapital:
+    """旧版 compute_total_risk_capital（向后兼容网格压力测试）。"""
+
+    def test_sums_grid_risk_for_all_engines(self, engine_1336: GridEngine):
+        from engine import compute_total_risk_capital
+
+        grid_risk = engine_1336.compute_risk_capital()
+        total = compute_total_risk_capital({"01336": engine_1336})
+        assert total == pytest.approx(grid_risk)
+
+    def test_returns_zero_for_empty_engines(self):
+        from engine import compute_total_risk_capital
+
+        assert compute_total_risk_capital({}) == 0.0
+
+
+
+# 补充 to_state_dict 带 position_summary 的分支（覆盖 line 468）
+class TestToStateDictWithPositionSummary:
+    def test_includes_position_summary_in_dict(self, engine_1336: GridEngine):
+        from engine import PositionSummary
+
+        engine_1336.position_summary = PositionSummary(
+            total_shares=5000, avg_cost=28.0, core_shares=500, total_budget=300000
+        )
+        result = engine_1336.to_state_dict()
+        assert "position_summary" in result
+        assert result["position_summary"]["total_shares"] == 5000
+        assert result["position_summary"]["total_budget"] == 300000.0
+
+    def test_no_position_summary_key_when_none(self, engine_1336: GridEngine):
+        engine_1336.position_summary = None
+        result = engine_1336.to_state_dict()
+        assert "position_summary" not in result

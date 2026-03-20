@@ -272,3 +272,185 @@ class TestGetValuationLabel:
     def test_label_no_data(self):
         label = get_valuation_label(-1.0, "股息率", 6.0, "%")
         assert "历史数据不足" in label
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fetch_pb_history
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchPbHistory:
+    def test_returns_list_on_success(self):
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_pb_history
+
+        fake_df = pd.DataFrame({"date": ["2023", "2022"], "pb": [1.2, 1.5]})
+        with patch.object(ak, "stock_hk_valuation_baidu", return_value=fake_df):
+            result = fetch_pb_history("01336")
+        assert result == [1.2, 1.5]
+
+    def test_returns_empty_on_empty_df(self):
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_pb_history
+
+        with patch.object(ak, "stock_hk_valuation_baidu", return_value=pd.DataFrame()):
+            result = fetch_pb_history("01336")
+        assert result == []
+
+    def test_returns_empty_on_exception(self):
+        import akshare as ak
+        from crawler import fetch_pb_history
+
+        with patch.object(ak, "stock_hk_valuation_baidu", side_effect=RuntimeError("net")):
+            result = fetch_pb_history("01336")
+        assert result == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fetch_div_yield_history
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchDivYieldHistory:
+    def test_returns_empty_when_price_nonpositive(self):
+        from crawler import fetch_div_yield_history
+
+        assert fetch_div_yield_history("01336", 0.0) == []
+        assert fetch_div_yield_history("01336", -5.0) == []
+
+    def test_returns_yield_list_on_success(self):
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_div_yield_history
+
+        fake_df = pd.DataFrame({
+            "除净日": ["2023-06-01", "2022-06-01", "2021-06-01"],
+            "分红方案": [
+                "每股派港币1.80元",
+                "每股派港币1.60元",
+                "每股派港币1.40元",
+            ],
+        })
+        with patch.object(ak, "stock_hk_dividend_payout_em", return_value=fake_df):
+            result = fetch_div_yield_history("01336", current_price=30.0, years=5)
+        assert len(result) == 3
+        assert result[0] == pytest.approx(1.80 / 30.0)
+
+    def test_returns_empty_on_exception(self):
+        import akshare as ak
+        from crawler import fetch_div_yield_history
+
+        with patch.object(ak, "stock_hk_dividend_payout_em", side_effect=RuntimeError("net")):
+            result = fetch_div_yield_history("01336", 30.0)
+        assert result == []
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fetch_pb_history
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchPbHistory:
+    def test_returns_list_on_success(self):
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_pb_history
+
+        fake_df = pd.DataFrame({"date": ["2023", "2022"], "pb": [1.2, 1.5]})
+        with patch.object(ak, "stock_hk_valuation_baidu", return_value=fake_df):
+            result = fetch_pb_history("01336")
+        assert result == [1.2, 1.5]
+
+    def test_returns_empty_on_empty_df(self):
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_pb_history
+
+        with patch.object(ak, "stock_hk_valuation_baidu", return_value=pd.DataFrame()):
+            result = fetch_pb_history("01336")
+        assert result == []
+
+    def test_returns_empty_on_exception(self):
+        import akshare as ak
+        from crawler import fetch_pb_history
+
+        with patch.object(ak, "stock_hk_valuation_baidu", side_effect=RuntimeError("net")):
+            result = fetch_pb_history("01336")
+        assert result == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fetch_div_yield_history
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchDivYieldHistory:
+    def test_returns_empty_when_price_nonpositive(self):
+        from crawler import fetch_div_yield_history
+
+        assert fetch_div_yield_history("01336", 0.0) == []
+        assert fetch_div_yield_history("01336", -5.0) == []
+
+    def test_returns_yield_list_on_success(self):
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_div_yield_history
+
+        fake_df = pd.DataFrame({
+            "除净日": ["2023-06-01", "2022-06-01", "2021-06-01"],
+            "分红方案": [
+                "每股派港币1.80元",
+                "每股派港币1.60元",
+                "每股派港币1.40元",
+            ],
+        })
+        with patch.object(ak, "stock_hk_dividend_payout_em", return_value=fake_df):
+            result = fetch_div_yield_history("01336", current_price=30.0, years=5)
+        assert len(result) == 3
+        assert result[0] == pytest.approx(1.80 / 30.0)
+
+    def test_returns_empty_on_exception(self):
+        import akshare as ak
+        from crawler import fetch_div_yield_history
+
+        with patch.object(ak, "stock_hk_dividend_payout_em", side_effect=RuntimeError("net")):
+            result = fetch_div_yield_history("01336", 30.0)
+        assert result == []
+
+
+
+# 补充 get_valuation_label 剩余分支：低估/合理/偏高
+class TestGetValuationLabelBranches:
+    def test_label_undervalued_75_pct(self):
+        from crawler import get_valuation_label
+        label = get_valuation_label(80.0, "PB", 1.2, "x")
+        assert "📈" in label
+        assert "低估" in label
+
+    def test_label_fair_50_pct(self):
+        from crawler import get_valuation_label
+        label = get_valuation_label(60.0, "PB", 1.5, "x")
+        assert "⚖️" in label
+        assert "合理" in label
+
+    def test_label_high_25_pct(self):
+        from crawler import get_valuation_label
+        label = get_valuation_label(35.0, "PB", 2.0, "x")
+        assert "📉" in label
+        assert "偏高" in label
+
+    def test_fetch_div_yield_history_empty_df(self):
+        """df 为空时应返回空列表（覆盖 line 306）。"""
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_div_yield_history
+
+        with patch.object(ak, "stock_hk_dividend_payout_em", return_value=pd.DataFrame()):
+            result = fetch_div_yield_history("01336", current_price=30.0)
+        assert result == []
+
+    def test_fetch_div_yield_history_missing_date_column(self):
+        """df 缺少除净日列时应返回空列表（覆盖 line 309）。"""
+        import akshare as ak
+        import pandas as pd
+        from crawler import fetch_div_yield_history
+
+        fake_df = pd.DataFrame({"分红方案": ["每股派港币1.80元"]})
+        with patch.object(ak, "stock_hk_dividend_payout_em", return_value=fake_df):
+            result = fetch_div_yield_history("01336", current_price=30.0)
+        assert result == []

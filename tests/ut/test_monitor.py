@@ -427,3 +427,98 @@ class TestRunOnceWatcherNotification:
         notifier_mock.notify_watcher.assert_called_once_with(
             code="02800", name="盈富", current_price=78.0, base_price=80.0
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh_valuation_history
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRefreshValuationHistory:
+    """refresh_valuation_history 函数独立于主循环，需单独测试。"""
+
+    def test_skips_stock_when_price_is_zero(self, sample_config, sample_state):
+        """价格为 0 时跳过该标的，不调用 fetch 函数。"""
+        from monitor import refresh_valuation_history
+
+        sample_state["latest_prices"] = {"01336": 0.0, "00525": 0.0}
+        with patch("monitor.fetch_div_yield_history") as mock_dy, \
+             patch("monitor.fetch_pb_history") as mock_pb:
+            # make lazy-imported functions patchable
+            import sys
+            sys.modules.setdefault("monitor", __import__("monitor"))
+            with patch("crawler.fetch_div_yield_history", return_value=[]) as mock_dy2, \
+                 patch("crawler.fetch_pb_history", return_value=[]) as mock_pb2:
+                refresh_valuation_history(sample_config, sample_state)
+        # 零价格时两个 fetch 都不应被调用
+        mock_dy2.assert_not_called()
+        mock_pb2.assert_not_called()
+
+    def test_updates_state_with_valuation_data(self, sample_config, sample_state):
+        """当价格有效时，state 中应写入 dy/pb 历史数据。"""
+        from monitor import refresh_valuation_history
+
+        sample_state["latest_prices"] = {"01336": 30.0, "00525": 4.0}
+        fake_dy = [0.06, 0.065, 0.07]
+        fake_pb = [1.2, 1.5, 1.8]
+        with patch("crawler.fetch_div_yield_history", return_value=fake_dy), \
+             patch("crawler.fetch_pb_history", return_value=fake_pb):
+            result = refresh_valuation_history(sample_config, sample_state)
+        assert "valuation_history" in result
+        assert result["valuation_history"]["01336"]["div_yield"] == fake_dy
+        assert result["valuation_history"]["01336"]["pb"] == fake_pb
+
+    def test_skips_disabled_stock(self, sample_config, sample_state):
+        """disabled=False 的标的不刷新估值数据。"""
+        from monitor import refresh_valuation_history
+
+        sample_config["stocks"][0]["enabled"] = False
+        sample_state["latest_prices"] = {"01336": 30.0, "00525": 4.0}
+        with patch("crawler.fetch_div_yield_history", return_value=[0.06]) as mock_dy, \
+             patch("crawler.fetch_pb_history", return_value=[1.2]) as mock_pb:
+            refresh_valuation_history(sample_config, sample_state)
+        # 01336 被禁用，只有 00525 会触发 fetch；mock 至多调用1次
+        assert mock_dy.call_count <= 1
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh_valuation_history
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRefreshValuationHistory:
+    """refresh_valuation_history 独立于主循环，需单独测试。"""
+
+    def test_skips_stock_when_price_is_zero(self, sample_config, sample_state):
+        """价格为 0 时跳过该标的，不调用 fetch 函数。"""
+        from monitor import refresh_valuation_history
+
+        sample_state["latest_prices"] = {"01336": 0.0, "00525": 0.0}
+        with patch("crawler.fetch_div_yield_history", return_value=[]) as mock_dy, \
+             patch("crawler.fetch_pb_history", return_value=[]) as mock_pb:
+            refresh_valuation_history(sample_config, sample_state)
+        mock_dy.assert_not_called()
+        mock_pb.assert_not_called()
+
+    def test_updates_state_with_valuation_data(self, sample_config, sample_state):
+        """价格有效时，state 中应写入 dy 和 pb 历史数据。"""
+        from monitor import refresh_valuation_history
+
+        sample_state["latest_prices"] = {"01336": 30.0, "00525": 4.0}
+        fake_dy = [0.06, 0.065, 0.07]
+        fake_pb = [1.2, 1.5, 1.8]
+        with patch("crawler.fetch_div_yield_history", return_value=fake_dy), \
+             patch("crawler.fetch_pb_history", return_value=fake_pb):
+            result = refresh_valuation_history(sample_config, sample_state)
+        assert "valuation_history" in result
+        assert result["valuation_history"]["01336"]["div_yield"] == fake_dy
+        assert result["valuation_history"]["01336"]["pb"] == fake_pb
+
+    def test_skips_disabled_stock(self, sample_config, sample_state):
+        """enabled=False 的标的不应刷新估值数据。"""
+        from monitor import refresh_valuation_history
+
+        sample_config["stocks"][0]["enabled"] = False
+        sample_state["latest_prices"] = {"01336": 30.0, "00525": 4.0}
+        with patch("crawler.fetch_div_yield_history", return_value=[0.06]) as mock_dy, \
+             patch("crawler.fetch_pb_history", return_value=[1.2]):
+            refresh_valuation_history(sample_config, sample_state)
+        # 01336 被禁用，只有 00525 会触发 fetch；mock 至多调用 1 次
+        assert mock_dy.call_count <= 1
