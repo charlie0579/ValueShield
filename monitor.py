@@ -150,7 +150,12 @@ def refresh_valuation_history(config: dict, state: dict) -> dict:
         pb_hist = fetch_pb_history(akcode)
         if pb_hist:
             val_hist["pb"] = pb_hist
-        logger.info("[%s] 历史估值数据已刷新: DY %d 条，PB %d 条", code, len(dy_hist), len(pb_hist))
+        # v2.6.1 ROE 历史
+        from crawler import fetch_roe_history
+        roe_hist = fetch_roe_history(akcode)
+        if roe_hist:
+            val_hist["roe"] = roe_hist
+        logger.info("[%s] 历史估值数据已刷新: DY %d 条，PB %d 条，ROE %d 条", code, len(dy_hist), len(pb_hist), len(roe_hist))
     return state
 
 

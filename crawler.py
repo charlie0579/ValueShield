@@ -431,6 +431,96 @@ def fetch_div_yield_history(
         return []
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.6.1 DCF 简易估值：3 年经营性现金流均值 × 永续增长折现
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_operating_cf_3y(akshare_code: str) -> list[float]:
+    """返回近 3 年经营性现金流（元），升序（旧→新）。
+
+    A 股使用 stock_cash_flow_sheet_by_report_em；H 股使用
+    stock_hk_cash_flow_em。失败时返回空列表。
+    """
+    import akshare as ak_inner
+    results: list[float] = []
+    # ── A 股尝试
+    if not akshare_code.startswith("0") or len(akshare_code) != 5:
+        try:
+            df = ak_inner.stock_cash_flow_sheet_by_report_em(symbol=akshare_code)
+            if df is not None and not df.empty:
+                cf_col = next(
+                    (c for c in df.columns if "经营" in str(c) and "现金流" in str(c)),
+                    None,
+                )
+                if cf_col:
+                    vals = df[cf_col].dropna().head(3).tolist()
+                    results = [float(v) for v in reversed(vals) if v != 0]
+        except Exception:
+            pass
+    # ── H 股尝试（5 位数字代码）
+    if not results:
+        try:
+            df = ak_inner.stock_hk_cash_flow_em(symbol=akshare_code)
+            if df is not None and not df.empty:
+                cf_col = next(
+                    (c for c in df.columns if "经营" in str(c) or "Operating" in str(c)),
+                    None,
+                )
+                if cf_col:
+                    vals = df[cf_col].dropna().head(3).tolist()
+                    results = [float(v) for v in reversed(vals) if v != 0]
+        except Exception:
+            pass
+    return results[-3:] if results else []
+
+
+def compute_dcf_value(
+    akshare_code: str,
+    growth_rate: float = 0.05,
+    discount_rate: float = 0.10,
+) -> "dict | None":
+    """用永续增长折现模型（Gordon Growth Model）估算内在价值。
+
+    公式：
+        cf_avg = 近 3 年经营性现金流均值
+        dcf_total = cf_avg * (1 + growth_rate) / (discount_rate - growth_rate)
+
+    Parameters
+    ----------
+    akshare_code : str
+        股票代码（如 "01336"）。
+    growth_rate : float
+        永续增长率，默认 5%。
+    discount_rate : float
+        折现率，默认 10%。
+
+    Returns
+    -------
+    dict | None
+        {
+            "cf_avg": float,       # 3 年经营性现金流均值（亿元）
+            "dcf_total": float,    # 估算内在价值合计（亿元）
+            "years": int,          # 实际使用年数
+            "note": str,           # 备注（如"H股接口近似"）
+        }
+        若无法获取现金流数据，返回 None。
+    """
+    cfs = _fetch_operating_cf_3y(akshare_code)
+    if not cfs:
+        return None
+    cf_avg = sum(cfs) / len(cfs)
+    if cf_avg <= 0:
+        return None  # 经营性现金流为负，不做估值
+    dcf_total = cf_avg * (1 + growth_rate) / (discount_rate - growth_rate)
+    return {
+        "cf_avg": round(cf_avg / 1e8, 2),      # 转亿元
+        "dcf_total": round(dcf_total / 1e8, 2),  # 转亿元
+        "years": len(cfs),
+        "note": "保守估算：5% 永续增长率，10% 折现率",
+    }
+
+
 def compute_percentile(
     current: float,
     history: list[float],

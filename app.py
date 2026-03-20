@@ -32,6 +32,8 @@ from crawler import (
     fetch_div_yield_history,
     fetch_pb_history,
     get_valuation_label,
+    compute_roe_stability,
+    compute_dcf_value,
 )
 from monitor import load_config, load_state, save_state, build_engines, build_watchers
 from magic_formula import (
@@ -513,10 +515,13 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     val_hist = state.get("valuation_history", {}).get(code, {})
     dy_hist = val_hist.get("div_yield", [])
     pb_hist = val_hist.get("pb", [])
+    roe_hist = val_hist.get("roe", [])
     dy_pct = compute_percentile(div_yield, dy_hist, higher_is_better=True)
     pb_pct = compute_percentile(0.0, pb_hist, higher_is_better=False)  # PB 值由监控层填充
     dy_label = get_valuation_label(dy_pct, "股息率", div_yield * 100, unit="%")
     pb_label = get_valuation_label(pb_pct, "PB", 0.0, unit="x") if pb_hist else ""
+    # v2.6.1 ROE 稳定性
+    roe_info = compute_roe_stability(roe_hist) if len(roe_hist) >= 2 else None
 
     # ── 标签页
     tab_monitor, tab_config, tab_settings = st.tabs(
@@ -631,11 +636,44 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         # 估值分位标签（若有历史数据）
         if dy_label:
             val_cls = "underval" if dy_pct >= 75 else ("overval" if dy_pct >= 0 and dy_pct < 25 else "neutral")
+            roe_badge_html = ""
+            if roe_info and roe_info.get("consecutive_decline", 0) >= 3:
+                roe_badge_html = (
+                    '<span class="lv-val-badge overval" title="' + roe_info.get("alert", "") + '">' +
+                    '⚠️ ROE衰减</span>'
+                )
             st.markdown(
                 f'<span class="lv-val-badge {val_cls}">{dy_label}</span>'
-                + (f'<span class="lv-val-badge neutral">{pb_label}</span>' if pb_label else ""),
+                + (f'<span class="lv-val-badge neutral">{pb_label}</span>' if pb_label else "")
+                + roe_badge_html,
                 unsafe_allow_html=True,
             )
+        # ROE 10 年趋势 expander（有数据时常驻显示）
+        if roe_hist:
+            _roe_label = "⚠️ ROE 衰减趋势 — 展开查看" if (roe_info and roe_info.get("consecutive_decline", 0) >= 3) else "📈 ROE 历史趋势（近 10 年）"
+            with st.expander(_roe_label, expanded=False):
+                if roe_info:
+                    cd = roe_info["consecutive_decline"]
+                    md = roe_info["max_drop"]
+                    stable = roe_info["stable"]
+                    alert = roe_info["alert"]
+                    if alert:
+                        st.warning(alert)
+                    c_l, c_r = st.columns(2)
+                    with c_l:
+                        st.metric("连续下滑年数", cd, delta=None)
+                        st.metric("较峰值最大跌幅", f"{md:.0%}")
+                    with c_r:
+                        st.metric("ROE 稳定性", "✅ 稳定" if stable else "⚠️ 预警", delta=None)
+                # 年份表格
+                import pandas as pd
+                n_years = len(roe_hist)
+                base_year = 2025 - n_years
+                roe_df = pd.DataFrame({
+                    "年份": [str(base_year + i + 1) for i in range(n_years)],
+                    "ROE": [f"{v:.1%}" for v in roe_hist],
+                })
+                st.dataframe(roe_df, use_container_width=True, hide_index=True)
 
         # PositionSummary 摘要行
         if ps is not None and ps.total_shares > 0:
@@ -1334,6 +1372,12 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
 
             with row3[2]:
                 # 复制财务摘要
+                # v2.6.1 DCF 估算（实时，允许失败）
+                _dcf = compute_dcf_value(stock.code)
+                _dcf_line = (
+                    f"估算内在价值 (DCF)：{_dcf['dcf_total']:.1f} 亿（基于近{_dcf['years']}年经营现金流均值 {_dcf['cf_avg']:.1f} 亿，{_dcf['note']}）"
+                    if _dcf else "估算内在价值 (DCF)：暂无现金流数据"
+                )
                 summary = (
                     f"【神奇公式分析摘要】{stock.name}（{stock.code}）\n"
                     f"市场：{stock.market}股 | 现价：{stock.price:.2f}\n"
@@ -1342,6 +1386,7 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
                     f"综合排名：#{stock.combined_rank}\n"
                     f"EBIT 估算：{stock.ebit/1e8:.2f} 亿\n"
                     f"企业价值：{stock.ev/1e8:.2f} 亿\n"
+                    f"{_dcf_line}\n"
                     f"数据质量：{'实算（EBIT）' if stock.data_quality == 'full' else 'PE/PB 近似'}\n"
                     f"（以上数据来自最新年报/季报，请结合定性分析使用）"
                 )

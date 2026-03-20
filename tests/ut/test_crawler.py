@@ -633,3 +633,74 @@ class TestPercentileAccuracy:
         """不足 4 条历史时返回 -1.0（无数据标记）。"""
         from crawler import compute_percentile
         assert compute_percentile(5.0, [1.0, 2.0, 3.0], higher_is_better=True) == -1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.6.1 DCF 简易估值测试
+# ─────────────────────────────────────────────────────────────────────────────
+from crawler import compute_dcf_value, _fetch_operating_cf_3y
+
+
+class TestDCFValue:
+    """验证 compute_dcf_value 公式计算及边界情况。"""
+
+    def test_basic_formula(self):
+        """正常 3 年现金流 → DCF = cf_avg * 1.05 / 0.05 = cf_avg * 21。"""
+        with patch("crawler._fetch_operating_cf_3y", return_value=[1e8, 1.2e8, 1.1e8]):
+            result = compute_dcf_value("01336")
+        assert result is not None
+        cf_avg = (1e8 + 1.2e8 + 1.1e8) / 3
+        expected_total = cf_avg * 1.05 / 0.05
+        assert abs(result["dcf_total"] - expected_total / 1e8) < 0.01
+
+    def test_returns_none_on_empty_cf(self):
+        """无现金流数据返回 None。"""
+        with patch("crawler._fetch_operating_cf_3y", return_value=[]):
+            assert compute_dcf_value("01336") is None
+
+    def test_returns_none_on_negative_cf(self):
+        """经营性现金流为负（亏损），不做估值，返回 None。"""
+        with patch("crawler._fetch_operating_cf_3y", return_value=[-1e8, -0.5e8, -0.8e8]):
+            assert compute_dcf_value("01336") is None
+
+    def test_custom_growth_discount(self):
+        """自定义增长率和折现率。"""
+        with patch("crawler._fetch_operating_cf_3y", return_value=[2e8, 2e8, 2e8]):
+            result = compute_dcf_value("01336", growth_rate=0.03, discount_rate=0.12)
+        assert result is not None
+        expected_total = 2e8 * 1.03 / (0.12 - 0.03)
+        assert abs(result["dcf_total"] - expected_total / 1e8) < 0.01
+
+    def test_years_field_reflects_actual_data(self):
+        """years 字段反映实际数据年数。"""
+        with patch("crawler._fetch_operating_cf_3y", return_value=[1e8, 1.1e8]):
+            result = compute_dcf_value("01336")
+        assert result is not None
+        assert result["years"] == 2
+
+    def test_result_contains_all_keys(self):
+        """返回 dict 包含 cf_avg / dcf_total / years / note 四个键。"""
+        with patch("crawler._fetch_operating_cf_3y", return_value=[1e8, 1e8, 1e8]):
+            result = compute_dcf_value("01336")
+        assert result is not None
+        assert {"cf_avg", "dcf_total", "years", "note"}.issubset(result.keys())
+
+
+class TestFetchOperatingCF:
+    """验证 _fetch_operating_cf_3y 容错机制。"""
+
+    def test_a_stock_exception_falls_through_to_empty(self):
+        """A 股接口抛异常且无 H 股兜底时返回空列表。"""
+        import akshare as _ak
+        with patch.object(_ak, "stock_cash_flow_sheet_by_report_em", side_effect=Exception("net err")):
+            # 非 5 位数字 → 走 A 股路径；H 股路径因代码不是 5 位不会触发
+            result = _fetch_operating_cf_3y("600000")
+        assert result == []
+
+    def test_a_stock_empty_df_returns_empty(self):
+        """A 股接口返回空 DataFrame 时返回空列表。"""
+        import akshare as _ak
+        import pandas as pd
+        with patch.object(_ak, "stock_cash_flow_sheet_by_report_em", return_value=pd.DataFrame()):
+            result = _fetch_operating_cf_3y("600000")
+        assert result == []

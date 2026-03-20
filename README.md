@@ -1,4 +1,4 @@
-# ValueShield — A/H 股价值投资管家 v2.6
+# ValueShield — A/H 股价值投资管家 v2.6.1
 
 > **设计哲学：算法为辅，主观为主；数据本地化；移动端优先。**
 >
@@ -283,6 +283,7 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 
 | 版本 | 核心改动 |
 |------|---------|
+| **v2.6.1** | 🔨 ROE 稳定性 UI 看板（⚠️ badge + 10 年趋势 expander）· DCF 简易估值（Gordon Growth）· monitor ROE 历史写入 · +8 条测试（356 passed） |
 | **v2.6** | 🛡️ 价格硬拦截（三通道均发散→return None）· ROE 稳定性监控（10年趋势+峰值跌幅）· `trading_mode` 字段 · +21 条测试（348 passed） |
 | **v2.5.1** | 🔧 双模式导航 Bug 修复 · engines 空值保护 · AppTest 7 条 UI 交互测试 |
 | **v2.5** | ✨ 神奇公式全市场扫描器（ROC+EY 双因子，A+H 股并行，日缓存） |
@@ -293,7 +294,7 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 ## 八、后续改进方向
 
 ### 🔧 功能层面
-- [ ] **ROE 稳定性看板集成**：将 `compute_roe_stability` 结果显示在单股详情卡片（`⚠️` 报警标签）
+- [x] **ROE 稳定性看板集成**：badge + 10 年趋势 expander（v2.6.1 ✅）
 - [ ] **PB 实时获取**：目前 PB 熔断依赖历史缓存，可增加实时 PB 触发熔断
 - [ ] **Watcher 推送去重**：加 1 小时 cooldown，避免同一机会重复推送
 - [ ] **历史成交记录**：卖出后持久化到 SQLite 并展示收益曲线
