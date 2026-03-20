@@ -974,6 +974,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
             st.rerun()
 
         _hr()
+        _is_manual_mode = stock_cfg.get("trading_mode", "manual") == "manual"
+        if _is_manual_mode:
+            st.info("🚫 手动模式：系统不执行自动下单，请在券商 APP 操作后使用下方手动补录。")
         st.markdown("**🟢 手动补录买入**")
         grid_prices_list = engine.grid_prices()
         buy_options = {

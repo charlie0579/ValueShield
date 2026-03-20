@@ -522,3 +522,110 @@ class TestRefreshValuationHistory:
             refresh_valuation_history(sample_config, sample_state)
         # 01336 被禁用，只有 00525 会触发 fetch；mock 至多调用 1 次
         assert mock_dy.call_count <= 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.6 E2E 通知链测试（买入信号 → state 写入 → Bark 通知）
+# ─────────────────────────────────────────────────────────────────────────────
+class TestNotificationChain:
+    """端到端验证：价格触发买入阈值时，monitor.run_once 完整执行通知链。
+
+    run_once(config, state, engines, notifier) → dict
+    """
+
+    @pytest.fixture
+    def minimal_config(self):
+        return {
+            "settings": {
+                "poll_interval_seconds": 30,
+                "bark_api_url": "https://api.day.app",
+                "bark_token": "test_token",
+                "cash_reserve": 0.0,
+                "lot_size_default": 500,
+                "grid_levels": 3,
+                "default_take_profit_pct": 0.07,
+                "min_holding_limit": 0,
+                "max_capital_usage": 0.0,
+                "web_server_url": "http://localhost:8501",
+            },
+            "stocks": [
+                {
+                    "code": "01336",
+                    "name": "新华保险",
+                    "exchange": "HK",
+                    "akshare_code": "01336",
+                    "base_price": 50.0,
+                    "hist_min": 14.0,
+                    "lot_size": 500,
+                    "step": 2.0,
+                    "take_profit_pct": 0.07,
+                    "enabled": True,
+                    "annual_dividend_hkd": 1.8,
+                    "total_budget": 100000.0,
+                    "trading_mode": "manual",
+                }
+            ],
+            "watchers": [],
+        }
+
+    @pytest.fixture
+    def minimal_state(self):
+        return {
+            "positions": {},
+            "pending_confirmations": [],
+            "latest_prices": {},
+            "latest_dividend_ttm": {},
+            "valuation_history": {},
+        }
+
+    @pytest.fixture
+    def mock_engines(self, minimal_config):
+        """构造 GridEngine 实例（使用真实 engine，不 mock 内部逻辑）。"""
+        from engine import GridEngine
+        stock = minimal_config["stocks"][0]
+        engine = GridEngine(
+            code=stock["code"],
+            name=stock["name"],
+            base_price=stock["base_price"],
+            step=stock["step"],
+            grid_levels=minimal_config["settings"]["grid_levels"],
+            lot_size=stock["lot_size"],
+            take_profit_pct=stock["take_profit_pct"],
+            hist_min=stock["hist_min"],
+        )
+        return {"01336": engine}
+
+    def test_buy_signal_appended_to_pending(self, minimal_config, minimal_state, mock_engines):
+        """价格触发买入格时，pending_confirmations 应新增一条 buy 记录。"""
+        from monitor import run_once
+        mock_notifier = MagicMock()
+
+        # grid_prices: [50, 48, 46]；price=47.5 < 48 → 第 2 格触发
+        with patch("monitor.fetch_realtime_price", return_value=47.5),              patch("monitor.fetch_dividend_ttm", return_value=1.8),              patch("monitor.save_state"):
+            new_state = run_once(minimal_config, minimal_state, mock_engines, mock_notifier)
+
+        pending = new_state.get("pending_confirmations", [])
+        buy_items = [p for p in pending if p.get("type") == "buy" and p.get("code") == "01336"]
+        assert len(buy_items) >= 1, f"应有 buy pending，实际 pending={pending}"
+
+    def test_no_buy_signal_when_price_above_all_grids(self, minimal_config, minimal_state, mock_engines):
+        """价格高于所有网格 → 无 buy pending。"""
+        from monitor import run_once
+        mock_notifier = MagicMock()
+
+        with patch("monitor.fetch_realtime_price", return_value=999.0),              patch("monitor.fetch_dividend_ttm", return_value=1.8),              patch("monitor.save_state"):
+            new_state = run_once(minimal_config, minimal_state, mock_engines, mock_notifier)
+
+        buy_items = [p for p in new_state.get("pending_confirmations", [])
+                     if p.get("type") == "buy" and p.get("code") == "01336"]
+        assert len(buy_items) == 0
+
+    def test_price_none_skips_state_write(self, minimal_config, minimal_state, mock_engines):
+        """fetch_realtime_price 返回 None（硬拦截）时，latest_prices 不更新。"""
+        from monitor import run_once
+        mock_notifier = MagicMock()
+
+        with patch("monitor.fetch_realtime_price", return_value=None),              patch("monitor.fetch_dividend_ttm", return_value=1.8),              patch("monitor.save_state"):
+            new_state = run_once(minimal_config, minimal_state, mock_engines, mock_notifier)
+
+        assert "01336" not in new_state.get("latest_prices", {}),             "价格为 None 时不应写入 latest_prices"

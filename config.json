@@ -24,7 +24,8 @@
       "take_profit_pct": 0.07,
       "enabled": true,
       "annual_dividend_hkd": 1.8,
-      "total_budget": 300000.0
+      "total_budget": 300000.0,
+      "trading_mode": "manual"
     },
     {
       "code": "00525",
@@ -38,7 +39,8 @@
       "take_profit_pct": 0.07,
       "enabled": true,
       "annual_dividend_hkd": 0.22,
-      "total_budget": 100000.0
+      "total_budget": 100000.0,
+      "trading_mode": "manual"
     }
   ],
   "watchers": [

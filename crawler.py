@@ -34,6 +34,7 @@ _USER_AGENTS = [
 
 _FAST_TIMEOUT = 5        # 秒：快熔断超时
 _DRIFT_THRESHOLD = 0.20  # 20% 偏差阈值，超过则告警并尝试第三通道
+_HARD_BLOCK_ON_DIVERGE = True  # 三通道均发散时，硬拒绝写入 state（返回 None）
 
 # 模块级状态：记忆上次成功通道 + 上次成功价格（用于偏差校验）
 _preferred_channel: str = "akshare"
@@ -190,12 +191,20 @@ def fetch_realtime_price(akshare_code: str) -> Optional[float]:
                 )
                 price = em_price
             else:
+                if _HARD_BLOCK_ON_DIVERGE:
+                    logger.error(
+                        "[%s] ⛔ 价格硬拦截：三通道均发散，本次拒绝写入 state "
+                        "（主通道=%.4f EM=%.4f 上次=%.4f），请人工核查。",
+                        akshare_code, price, em_price,
+                        _last_known_prices.get(akshare_code, 0),
+                    )
+                    return None  # 硬拒绝：不写 state，不更新 _last_known_prices
                 logger.warning(
-                    "[%s] 三通道均出现大偏差，保留当前值 %.4f HKD，请人工核查。",
+                    "[%s] 三通道均出现大偏差，保留当前値 %.4f HKD，请人工核查。",
                     akshare_code, price,
                 )
         except Exception as em_exc:
-            logger.warning("[%s] EM Web 第三通道失败: %s，保留当前值。", akshare_code, em_exc)
+            logger.warning("[%s] EM Web 第三通道失败: %s，保留当前値。", akshare_code, em_exc)
 
     # ── 记录本次价格供下次偏差校验
     _last_known_prices[akshare_code] = price
@@ -287,6 +296,194 @@ def fetch_pb_history(akshare_code: str) -> list[float]:
     except Exception as exc:
         logger.warning("[%s] 获取历史PB失败: %s", akshare_code, exc)
         return []
+
+
+def fetch_roe_history(akshare_code: str, years: int = 10) -> list[float]:
+    """
+    获取标的近 N 年的 ROE（净资产收益率）历史数据。
+    A 股使用 AkShare 财务指标接口；H 股无直接接口时返回空列表。
+    返回：最近 years 年的 ROE 列表（小数，如 0.15 = 15%），升序排列（旧→新）。
+    """
+    try:
+        # 优先尝试 A 股财务指标接口
+        df = ak.stock_financial_analysis_indicator(symbol=akshare_code, start_year=str(datetime.now().year - years))
+        if df is None or df.empty:
+            return []
+        # 列名适配
+        roe_col = next((c for c in df.columns if "净资产收益率" in str(c) or "ROE" in str(c).upper()), None)
+        date_col = next((c for c in df.columns if "日期" in str(c) or "报告期" in str(c)), None)
+        if roe_col is None:
+            return []
+        roes: list[float] = []
+        for _, row in df.iterrows():
+            val = _safe_parse_pct(row.get(roe_col))
+            if val is not None and val != 0.0:
+                roes.append(val)
+        # 去重并返回最近 years 个
+        return roes[-years:] if roes else []
+    except Exception as exc:
+        logger.debug("[%s] fetch_roe_history 失败: %s", akshare_code, exc)
+        return []
+
+
+def _safe_parse_pct(val) -> Optional[float]:
+    """将百分比字符串或数值解析为小数。如 '15.3%' → 0.153；0.153 → 0.153。"""
+    if val is None:
+        return None
+    try:
+        s = str(val).strip().replace("%", "")
+        f = float(s)
+        # 若绝对值 > 2，认为是百分比形式（如 15.3），转换为小数
+        return f / 100.0 if abs(f) > 2 else f
+    except (ValueError, TypeError):
+        return None
+
+
+def compute_roe_stability(
+    roe_history: list[float],
+    decline_threshold: float = 0.20,
+    consecutive_years: int = 3,
+) -> dict:
+    """
+    分析 ROE 历史序列的稳定性。
+
+    Args:
+        roe_history: ROE 序列（升序，旧→新），小数形式。
+        decline_threshold: 最新值相比历史均值下滑多少触发预警（默认 20%）。
+        consecutive_years: 连续下滑多少年触发预警（默认 3）。
+
+    Returns:
+        dict with keys:
+            mean_roe         - 历史均值（float or None）
+            latest_roe       - 最新值（float or None）
+            is_declining     - 是否触发预警（bool）
+            decline_reason   - 预警原因字符串（"" = 无预警）
+            data_sufficient  - 数据是否充足（bool，< 3 年时为 False）
+    """
+    if len(roe_history) < 3:
+        return {
+            "mean_roe": None,
+            "latest_roe": roe_history[-1] if roe_history else None,
+            "is_declining": False,
+            "decline_reason": "",
+            "data_sufficient": False,
+        }
+
+    mean_roe = sum(roe_history) / len(roe_history)
+    latest_roe = roe_history[-1]
+    reasons: list[str] = []
+
+    # 预警条件 1：最新 ROE 相比均值下滑超过阈值
+    if mean_roe > 0 and latest_roe < mean_roe * (1 - decline_threshold):
+        reasons.append(f"最新ROE {latest_roe:.1%} 低于均值 {mean_roe:.1%} 超过 {decline_threshold:.0%}")
+
+    # 预警条件 2：连续 N 年下滑
+    if len(roe_history) >= consecutive_years:
+        tail = roe_history[-consecutive_years:]
+        if all(tail[i] > tail[i + 1] for i in range(len(tail) - 1)):
+            reasons.append(f"ROE 已连续 {consecutive_years} 年下滑")
+
+    return {
+        "mean_roe": mean_roe,
+        "latest_roe": latest_roe,
+        "is_declining": bool(reasons),
+        "decline_reason": "；".join(reasons),
+        "data_sufficient": True,
+    }
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ROE 稳定性辅助函数
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_parse_pct(val) -> "float | None":
+    """把百分比字符串（如 '12.34%'）或数值统一转换为小数（0.1234），失败返回 None。"""
+    if val is None:
+        return None
+    try:
+        s = str(val).strip().rstrip("%")
+        return float(s) / 100.0 if "%" in str(val) else float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def fetch_roe_history(akshare_code: str, years: int = 10) -> list[float]:
+    """抓取近 N 年（年报）ROE，返回升序列表（最早 → 最新），单位为小数。
+
+    数据源：akshare.stock_financial_analysis_indicator（东方财富）。
+    若数据不足 2 条则返回空列表（调用方应做健壮性处理）。
+    """
+    try:
+        import akshare as ak
+        df = ak.stock_financial_analysis_indicator(symbol=akshare_code, start_year="2005")
+        if df is None or df.empty:
+            return []
+        # 列名因版本差异，兼容两种命名
+        roe_col = next(
+            (c for c in df.columns if "净资产收益率" in c or "ROE" in c.upper()),
+            None,
+        )
+        if roe_col is None:
+            logger.warning("[%s] fetch_roe_history: 未找到 ROE 列，列名=%s", akshare_code, list(df.columns))
+            return []
+        # 筛选年报（报告期包含 "12-31"）
+        if "报告期" in df.columns:
+            df = df[df["报告期"].astype(str).str.endswith("12-31")]
+        elif "REPORT_DATE" in df.columns:
+            df = df[df["REPORT_DATE"].astype(str).str.endswith("12-31")]
+        df = df.tail(years)
+        result = [_safe_parse_pct(v) for v in df[roe_col].tolist()]
+        return [v for v in result if v is not None]
+    except Exception as exc:
+        logger.warning("[%s] fetch_roe_history 失败: %s", akshare_code, exc)
+        return []
+
+
+def compute_roe_stability(
+    roe_history: list[float],
+    decline_threshold: float = 0.20,
+    consecutive_years: int = 3,
+) -> dict:
+    """分析 ROE 序列的稳定性，返回结构化结果。
+
+    Returns
+    -------
+    dict with keys:
+        stable (bool): 无报警时为 True
+        consecutive_decline (int): 连续下降年数
+        max_drop (float): 相对历史峰值的最大跌幅
+        alert (str): 空字符串或警告信息
+    """
+    if len(roe_history) < 2:
+        return {"stable": True, "consecutive_decline": 0, "max_drop": 0.0, "alert": ""}
+
+    # 连续下降年数（从最新往前数）
+    consecutive = 0
+    for i in range(len(roe_history) - 1, 0, -1):
+        if roe_history[i] < roe_history[i - 1]:
+            consecutive += 1
+        else:
+            break
+
+    # 相对历史峰值的最大跌幅
+    peak = max(roe_history)
+    latest = roe_history[-1]
+    max_drop = (peak - latest) / peak if peak > 0 else 0.0
+
+    alerts: list[str] = []
+    if consecutive >= consecutive_years:
+        alerts.append(f"ROE 已连续 {consecutive} 年下滑")
+    if max_drop >= decline_threshold:
+        alerts.append(f"ROE 较峰值下跌 {max_drop:.0%}")
+
+    alert_str = "⚠️ " + "；".join(alerts) if alerts else ""
+    return {
+        "stable": not bool(alerts),
+        "consecutive_decline": consecutive,
+        "max_drop": max_drop,
+        "alert": alert_str,
+    }
 
 
 def fetch_div_yield_history(
