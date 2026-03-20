@@ -37,12 +37,6 @@ from magic_formula import (
     StockScore,
     is_cache_fresh,
     load_cache as load_mf_cache,
-    scan_magic_formula,
-)
-from magic_formula import (
-    StockScore,
-    is_cache_fresh,
-    load_cache as load_mf_cache,
     save_cache as save_mf_cache,
     scan_magic_formula,
 )
@@ -222,11 +216,25 @@ def render_sidebar(config: dict, state: dict) -> str:
         st.markdown(
             '<div style="padding:16px 12px 8px;">'
             '<div style="font-size:1.1rem;font-weight:800;color:#111827;">🛡️ ValueShield</div>'
-            '<div style="font-size:0.65rem;color:#9CA3AF;margin-top:2px;">v2.4 · 价值投资管家</div>'
+            '<div style="font-size:0.65rem;color:#9CA3AF;margin-top:2px;">v2.5 · 价值投资管家</div>'
             '</div>',
             unsafe_allow_html=True,
         )
         st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
+
+        # ── 顶级模式切换器
+        app_mode = st.radio(
+            "导航模式",
+            ["📈 仓位管理", "✨ 市场发现"],
+            key="app_mode",
+            label_visibility="collapsed",
+            horizontal=True,
+        )
+        st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
+
+        if app_mode == "✨ 市场发现":
+            st.caption("神奇公式全市场扫描")
+            return "__discovery__"
 
         # ── 📊 当前持仓
         st.markdown(
@@ -415,6 +423,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     selected_code = render_sidebar(config, state)
 
+    # ── 顶级模式路由：市场发现模式全屏展示神奇公式
+    if selected_code == "__discovery__":
+        _render_magic_formula_tab(config, state)
+        return
+
     # v2.4 风险计算：优先使用预算公式，退化用网格压力测试
     current_prices = state.get("latest_prices", {})
     total_risk = compute_total_risk_capital_v2(engines, current_prices)
@@ -489,8 +502,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     pb_label = get_valuation_label(pb_pct, "PB", 0.0, unit="x") if pb_hist else ""
 
     # ── 标签页
-    tab_monitor, tab_config, tab_settings, tab_magic = st.tabs(
-        ["📊 实时监控", "⚙️ 网格配置", "🛠️ 系统设置", "✨ 神奇公式 Top 30"]
+    tab_monitor, tab_config, tab_settings = st.tabs(
+        ["📊 实时监控", "⚙️ 网格配置", "🛠️ 系统设置"]
     )
 
     # ════════════════════════════════════════════════════════════════
@@ -1026,7 +1039,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     st.markdown(
         '<div style="text-align:center;color:#E5E7EB;font-size:0.6rem;padding:20px 0 6px;">'
-        'ValueShield v2.4 · 价值投资管家 · 算法为辅，主观为主</div>',
+        'ValueShield v2.5 · 价值投资管家 · 算法为辅，主观为主</div>',
         unsafe_allow_html=True,
     )
 
@@ -1130,12 +1143,6 @@ def _render_watcher_card(watcher_cfg: dict, state: dict, config: dict, engines: 
                 st.toast(f"✅ {name} 已从观察名单移入持仓！")
                 st.rerun()
 
-
-    # ════════════════════════════════════════════════════════════════
-    # ✨ 神奇公式 Top 30
-    # ════════════════════════════════════════════════════════════════
-    with tab_magic:
-        _render_magic_formula_tab(config, state)
 
 if __name__ == "__main__":
     main()
