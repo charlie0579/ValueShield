@@ -295,3 +295,183 @@ class TestDiscoveryModeSwitch:
             )
         finally:
             _stop_patches(patchers)
+
+
+
+# ── v2.6.1 ROE badge / expander 测试 ─────────────────────────────────────────
+
+class TestROEBadgeAndExpander:
+    """ROE 衰减 badge 和 10 年趋势 expander 渲染测试。"""
+
+    # 连续 3 年下跌的 ROE 历史（触发 badge）
+    _DECLINING_ROE = [0.30, 0.25, 0.20, 0.15]
+    _STABLE_ROE    = [0.28, 0.29, 0.30, 0.31]
+
+    def _state_with_roe(self, roe_list: list) -> dict:
+        s = {
+            "last_updated": "",
+            "positions": {"01336": {"grid_occupied": {}, "holdings": []}},
+            "latest_prices": {"01336": 28.5},
+            "latest_dividend_ttm": {"01336": 1.8},
+            "alerts": [],
+            "pending_confirmations": [],
+            "valuation_history": {"01336": {"roe": roe_list}},
+        }
+        return s
+
+    def test_declining_roe_renders_without_exception(self):
+        """连续 3 年 ROE 下跌时，页面不崩溃。"""
+        roe_info = {
+            "stable": False,
+            "consecutive_decline": 3,
+            "max_drop": 0.50,
+            "alert": "ROE 连续 3 年下跌，最大跌幅 50.0%",
+        }
+        patchers = _start_patches(extra={
+            "monitor.load_state": self._state_with_roe(self._DECLINING_ROE),
+            "crawler.compute_roe_stability": roe_info,
+        })
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            assert not at.exception, f"ROE 衰减时页面崩溃：{at.exception}"
+        finally:
+            _stop_patches(patchers)
+
+    def test_roe_expander_visible_when_history_present(self):
+        """有 ROE 历史数据时，expander label 包含 'ROE' 关键字。"""
+        roe_info = {
+            "stable": False,
+            "consecutive_decline": 3,
+            "max_drop": 0.50,
+            "alert": "ROE 连续 3 年下跌",
+        }
+        patchers = _start_patches(extra={
+            "monitor.load_state": self._state_with_roe(self._DECLINING_ROE),
+            "crawler.compute_roe_stability": roe_info,
+        })
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            assert not at.exception
+            expander_labels = [e.label for e in at.expander]
+            assert any("ROE" in lbl for lbl in expander_labels), (
+                f"未找到含 ROE 的 expander，实际 expander：{expander_labels!r}"
+            )
+        finally:
+            _stop_patches(patchers)
+
+    def test_stable_roe_shows_neutral_expander_label(self):
+        """ROE 稳定时，expander label 为正向（不含 '衰减'）。"""
+        roe_info = {
+            "stable": True,
+            "consecutive_decline": 0,
+            "max_drop": 0.03,
+            "alert": "",
+        }
+        patchers = _start_patches(extra={
+            "monitor.load_state": self._state_with_roe(self._STABLE_ROE),
+            "crawler.compute_roe_stability": roe_info,
+        })
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            assert not at.exception
+            expander_labels = [e.label for e in at.expander]
+            roe_expanders = [lbl for lbl in expander_labels if "ROE" in lbl]
+            assert roe_expanders, "ROE 历史存在时应有 ROE expander"
+            assert not any("衰减" in lbl for lbl in roe_expanders), (
+                f"ROE 稳定时 expander label 不应含'衰减'，实际：{roe_expanders!r}"
+            )
+        finally:
+            _stop_patches(patchers)
+
+    def test_no_roe_history_no_roe_expander(self):
+        """valuation_history 无 roe 键时，不应出现 ROE expander（回归保护）。"""
+        patchers = _start_patches()  # _MINIMAL_STATE 无 roe 字段
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            assert not at.exception
+            expander_labels = [e.label for e in at.expander]
+            assert not any("ROE" in lbl for lbl in expander_labels), (
+                f"无 ROE 数据时不应渲染 ROE expander，实际：{expander_labels!r}"
+            )
+        finally:
+            _stop_patches(patchers)
+
+
+# ── v2.6.1 DCF 财务摘要文本测试 ──────────────────────────────────────────────
+
+class TestDCFInMagicFormulaSummary:
+    """神奇公式股票卡片中 DCF 估值行的渲染测试。"""
+
+    _DCF_RESULT = {
+        "cf_avg": 58.8,
+        "dcf_total": 1234.5,
+        "years": 3,
+        "note": "g=5% r=10%",
+    }
+
+    def _patchers_with_fresh_cache(self, dcf_return_value) -> list:
+        return _start_patches(extra={
+            "magic_formula.load_cache": _MOCK_CACHE_FRESH,
+            "magic_formula.is_cache_fresh": True,
+            "crawler.compute_dcf_value": dcf_return_value,
+        })
+
+    def test_dcf_with_mock_data_no_exception(self):
+        """有现金流数据时，DCF 行渲染不崩溃。"""
+        patchers = self._patchers_with_fresh_cache(self._DCF_RESULT)
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            at.sidebar.radio[0].set_value("✨ 市场发现")
+            at.run()
+            assert not at.exception, f"DCF 有数据时页面崩溃：{at.exception}"
+        finally:
+            _stop_patches(patchers)
+
+    def test_dcf_none_still_renders_gracefully(self):
+        """无现金流数据（DCF 返回 None）时，页面不崩溃，显示兜底文本。"""
+        patchers = self._patchers_with_fresh_cache(None)
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            at.sidebar.radio[0].set_value("✨ 市场发现")
+            at.run()
+            assert not at.exception, f"DCF 为 None 时页面崩溃：{at.exception}"
+        finally:
+            _stop_patches(patchers)
+
+    def test_dcf_line_appears_in_code_block(self):
+        """st.code 摘要块中包含 'DCF' 字样（数据存在时）。"""
+        patchers = self._patchers_with_fresh_cache(self._DCF_RESULT)
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            at.sidebar.radio[0].set_value("✨ 市场发现")
+            at.run()
+            assert not at.exception
+            code_texts = [c.value for c in at.code]
+            assert any("DCF" in t for t in code_texts), (
+                f"st.code 中未找到 DCF 字样，实际 code blocks：{code_texts!r}"
+            )
+        finally:
+            _stop_patches(patchers)
+
+    def test_dcf_fallback_text_when_no_cashflow(self):
+        """无现金流时，st.code 中包含兜底文案 '暂无现金流'。"""
+        patchers = self._patchers_with_fresh_cache(None)
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            at.sidebar.radio[0].set_value("✨ 市场发现")
+            at.run()
+            assert not at.exception
+            code_texts = [c.value for c in at.code]
+            assert any("暂无现金流" in t for t in code_texts), (
+                f"无现金流时兜底文案缺失，实际 code blocks：{code_texts!r}"
+            )
+        finally:
+            _stop_patches(patchers)
