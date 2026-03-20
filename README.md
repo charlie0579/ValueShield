@@ -1,4 +1,4 @@
-# ValueShield — A/H 股价值投资管家 v2.5.1
+# ValueShield — A/H 股价值投资管家 v2.6
 
 > **设计哲学：算法为辅，主观为主；数据本地化；移动端优先。**
 >
@@ -19,7 +19,7 @@
 - 每只股票配置 `total_budget`（计划总投入上限）
 - 风险资金需求 = `max(0, total_budget - market_value)`，预算用完自动归零
 - 首页实时展示预算进度条（已投入 % / 总预算）
-- 全仓汇总：`compute_total_risk_capital_v2` 按预算公式累加，无预算时退化至旧网格逻辑
+- 全仓汇总：`compute_total_risk_capital_v2` 按预算公式累加
 
 ### 3. 5-10 年估值锚点
 - **PB 历史分位**：拉取近 5-10 年市净率序列，实时计算当前分位
@@ -40,7 +40,7 @@
 - 自动识别中国法定节假日，进入静默模式（基于 `chinese_calendar` 库）
 - 默认每 30 秒轮询一次（`config.json` 可调）
 
-### 6. 三通道行情获取
+### 6. 三通道行情获取 + 价格硬拦截（v2.6 ⚡）
 
 | 优先级 | 数据源 | 说明 |
 |--------|--------|------|
@@ -48,18 +48,46 @@
 | B（备用）| 新浪财经 `hq.sinajs.cn` | 快速熔断切换 |
 | C（兜底）| 东方财富 Web `push2.eastmoney.com` | 终极保障 |
 
-20% 偏差校验：三通道结果相互验证，异常时记录警告并保留上次有效价。
+**v2.6 铁甲机制：**
+- **20% 偏差校验**：单通道结果偏离上次已知价 > 20% 时，自动触发第三通道（EM Web）交叉验证
+- **三通道均发散 → 硬拦截**：若主通道和 EM Web 均超阈值（`_HARD_BLOCK_ON_DIVERGE = True`），`fetch_realtime_price` 返回 `None`，**拒绝写入 state**，防止价格跳空污染仓位计算
 
-### 7. Web 看板（同花顺风格）
+### 7. ROE 稳定性监控（v2.6 ⚡）
+
+新增三个函数，支持 ROE 10 年趋势分析：
+
+| 函数 | 作用 |
+|------|------|
+| `fetch_roe_history(code, years=10)` | 抓取近 N 年年报 ROE，返回升序列表（小数） |
+| `_safe_parse_pct(val)` | 将 `"12.34%"` 或 `0.1234` 统一转换为小数，失败返回 `None` |
+| `compute_roe_stability(history, ...)` | 分析 ROE 趋势，连续下滑 ≥ 3 年或较峰值下跌 ≥ 20% → `⚠️` 报警 |
+
+`compute_roe_stability` 返回结构：
+
+```python
+{
+    "stable": bool,             # 无报警时为 True
+    "consecutive_decline": int, # 当前连续下滑年数
+    "max_drop": float,          # 相对历史峰值的最大跌幅（0.25 = 25%）
+    "alert": str,               # "" 或 "⚠️ ROE 已连续 3 年下滑；ROE 较峰值下跌 25%"
+}
+```
+
+### 8. `trading_mode` 字段（v2.6 ⚡）
+- `config.json` 每支股票新增 `"trading_mode": "manual"` | `"auto"` 字段
+- `"manual"` 模式（默认）：Web 看板手动补录区顶部显示信息条
+  > 🚫 手动模式：系统不执行自动下单，请在券商 APP 操作后使用下方手动补录。
+- 为后续自动化交易接口预留标志位
+
+### 9. Web 看板（同花顺风格）
 - **侧边栏双模式切换**（顶部 radio，水平排布）：
   - 📈 **仓位管理**：双分组列表 — 📊 当前持仓（显示浮盈 %）+ 🔍 观察名单（显示距建仓价 %）
   - ✨ **市场发现**：全屏神奇公式看板（独立模式，不与标签页共享层级）
-- 圆角卡片布局，支持深色 / 浅色主题切换
-- 持仓详情：5 列卡片（总股 / 均价 / 现价 / 浮盈 / 市值）+ 预算进度条
+- 圆角卡片布局，持仓详情：5 列卡片（总股 / 均价 / 现价 / 浮盈 / 市值）+ 预算进度条
 - 估值分位标签（PB / 股息率 emoji 实时显示）
 - 配置页"👤 一键对齐账户"expander，手动同步真实持仓
 
-### 8. ✨ 神奇公式全市场扫描器（v2.5）
+### 10. ✨ 神奇公式全市场扫描器（v2.5）
 
 格林布拉特双因子模型：ROC（资本回报率）+ EY（盈利收益率）综合排名
 
@@ -71,14 +99,9 @@ EY  = EBIT / EV    （EV = 市值 + 净负债）
 - **全市场覆盖**：A 股（沪深主板 / 创业板 / 科创板）+ H 股（按市值过滤）
 - **行业过滤**：自动剔除银行 / 保险 / 证券 / 信托 / 多元金融
 - **双排名机制**：ROC 排名 + EY 排名相加，取综合排名最低 Top 30
-- **A 股**：实际财报数据（资产负债表 + 利润表，`data_quality="full"`）
-- **H 股**：优先财报接口，失败时退化 PE/PB 近似（`data_quality="approx"`）
 - **AH 折价标识**：H 股相对 A 股同名股折价率实时显示
-- **日缓存机制**：每日盘前自动扫描（`maybe_refresh_magic_formula`），缓存 18 小时
-- **UI 交互**：
-  - 🔄 手动"重新扫描全市场"（带实时进度条）
-  - ➕ 一键加入 `watchers` 观察名单（建仓价默认 = 九折）
-  - 📋 复制财务摘要（可粘贴给 Gemini 进行 6+2 深度主观分析）
+- **日缓存机制**：缓存 18 小时，每日盘前自动刷新
+- **UI 交互**：🔄 手动扫描 · ➕ 一键加入 watchers · 📋 复制财务摘要给 Gemini
 
 ---
 
@@ -86,27 +109,27 @@ EY  = EBIT / EV    （EV = 市值 + 净负债）
 
 ```
 ValueShield/
-├── app.py                    # Streamlit Web 看板（v2.5.1，双模式导航）
+├── app.py                    # Streamlit Web 看板（v2.6，双模式导航 + trading_mode 提示）
 ├── monitor.py                # 后台监控轮询（交易信号 + Watcher + 盘前神奇公式刷新）
 ├── engine.py                 # 核心算法（GridEngine / PositionSummary / WatcherTarget）
-├── crawler.py                # 三通道行情获取 + 估值历史（PB / 股息率分位）
+├── crawler.py                # 三通道行情 + 价格硬拦截 + ROE 稳定性 + 估值历史
 ├── magic_formula.py          # 神奇公式扫描器（ROC+EY 双因子，A+H 股，并行抓取）
 ├── notifier.py               # Bark API 推送（买入 / 卖出 / 风险预警 / 建仓机会）
-├── config.json               # 静态配置（标的参数、Bark Token、watchers 列表）
+├── config.json               # 静态配置（标的参数含 trading_mode、Bark Token、watchers）
 ├── state.json                # 实时持仓状态（.tmp + os.replace() 原子写入）
 ├── magic_formula_cache.json  # 神奇公式扫描缓存（18 小时有效）
 ├── requirements.txt
 └── tests/
-    ├── conftest.py           # 全局 fixtures（GridEngine、config、state）
-    ├── ut/                   # 单元测试（mock 所有外部 I/O，无网络依赖）
-    │   ├── test_app_ui.py        # Streamlit AppTest UI 交互测试（7 个）
+    ├── conftest.py
+    ├── ut/
+    │   ├── test_app_ui.py        # AppTest UI 交互测试（7 个）
     │   ├── test_engine.py        # GridEngine / PositionSummary / WatcherTarget
-    │   ├── test_crawler.py       # 三通道行情 + 估值分位函数
+    │   ├── test_crawler.py       # 三通道 + 价格硬拦截 + ROE + 估值分位
     │   ├── test_magic_formula.py # 神奇公式计算逻辑 + 缓存
-    │   ├── test_monitor.py       # 监控循环 + 节假日判断
+    │   ├── test_monitor.py       # 监控循环 + E2E 通知链
     │   └── test_notifier.py      # Bark 推送各通知类型
-    └── smoke/                # 影子数据冒烟测试（需真实网络，手动运行）
-        └── test_live_probe.py    # 真实 AkShare 接口验活 + ROC/EY 可算性验证
+    └── smoke/
+        └── test_live_probe.py    # 真实 AkShare 接口验活（需网络，手动运行）
 ```
 
 **技术栈：** Python 3.12 · AkShare · Streamlit 1.55 · Requests · chinese_calendar
@@ -157,6 +180,7 @@ streamlit run app.py --server.port 8502 --server.address 0.0.0.0
       "annual_dividend_hkd": 1.80,
       "lot_size": 500,
       "total_budget": 300000.0,
+      "trading_mode": "manual",
       "enabled": true
     }
   ],
@@ -178,6 +202,7 @@ streamlit run app.py --server.port 8502 --server.address 0.0.0.0
 | `base_price` | 网格基准价（持仓）或建仓触发价（观察者） |
 | `hist_min` | 历史最低价，决定网格底部边界 |
 | `total_budget` | 计划总投入上限（HKD），用于风险资金计算 |
+| `trading_mode` | `"manual"`（默认）：手动模式看板提示；`"auto"`：为未来自动接口预留 |
 | `watchers` | 零持仓监控列表，现价 ≤ `base_price` 时推送建仓提醒 |
 
 ---
@@ -188,15 +213,15 @@ streamlit run app.py --server.port 8502 --server.address 0.0.0.0
 
 | 层次 | 位置 | 运行时机 | 核心价值 |
 |------|------|---------|---------|
-| **单元测试** | `tests/ut/` | 每次 commit（自动）| mock 所有 I/O，毫秒级，覆盖计算逻辑 |
-| **UI 交互测试** | `tests/ut/test_app_ui.py` | 每次 commit（自动）| AppTest 模拟用户点击，防止渲染路径断裂 |
-| **影子数据冒烟** | `tests/smoke/` | 手动（有网络时）| 真实 AkShare 接口验活，发现数据格式变更 |
+| **单元测试** | `tests/ut/` | 每次 commit（自动）| mock 所有 I/O，毫秒级 |
+| **UI 交互测试** | `tests/ut/test_app_ui.py` | 每次 commit（自动）| AppTest 防止渲染路径断裂 |
+| **影子数据冒烟** | `tests/smoke/` | 手动（有网络时）| 真实 AkShare 接口验活 |
 
 ```bash
-# 常规 CI（无需网络，327 个测试，约 15s）
+# 常规 CI（无需网络，348 个测试，约 13s）
 python3.12 -m pytest tests/ -q
 
-# AkShare 接口验活（节假日后 / 更新 magic_formula.py 后运行）
+# AkShare 接口验活
 python3.12 -m pytest -m smoke tests/smoke/ -v
 ```
 
@@ -206,35 +231,41 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 |------|--------|------|
 | engine.py | **100%** | GridEngine / PositionSummary / WatcherTarget 全覆盖 |
 | notifier.py | **100%** | 买入 / 卖出 / 风险预警 / 建仓机会推送全覆盖 |
-| crawler.py | 94% | 三通道行情 + 估值分位函数 |
-| magic_formula.py | 91% | ROC/EY 计算、缓存读写、宇宙构建、并行扫描 |
-| monitor.py | 89% | 主监控循环、Watcher 循环、节假日判断 |
+| monitor.py | **89%** | 主监控循环、节假日判断、E2E 通知链 |
+| magic_formula.py | **91%** | ROC/EY 计算、缓存读写、并行扫描 |
+| crawler.py | **76%** | 三通道行情 + 价格硬拦截 + ROE 稳定性 + 估值分位 |
 
-**327 passed**（16 smoke 测试在 CI 中自动排除，`-m "not smoke"`）
+**348 passed**（16 smoke 测试自动排除，`-m "not smoke"`）
 
-### AppTest 覆盖的核心交互路径
+### v2.6 新增测试（+21）
+
+| 类 | 文件 | 数 | 覆盖场景 |
+|---|---|---|---|
+| `TestPriceOutlier` | test_crawler.py | 4 | 三通道均发散硬拦截→None、首次采集接受、EM Web 纠偏、ERROR 日志 |
+| `TestROEStability` | test_crawler.py | 8 | 稳定/连续下滑/峰值跌幅/数据不足/`_safe_parse_pct` 解析 |
+| `TestPercentileAccuracy` | test_crawler.py | 6 | 中位/极值/低优先/越界截断/数据不足返回 -1 |
+| `TestNotificationChain` | test_monitor.py | 3 | E2E：价格触发→pending 写入、无触发、None 不写 state |
+
+### AppTest 覆盖的核心路径
 
 | 测试用例 | 验证内容 |
 |---------|---------|
 | `test_first_run_has_no_exception` | 首次渲染无任何异常 |
 | `test_sidebar_radio_exists_with_two_options` | 侧边栏 radio 含两个导航选项 |
-| `test_empty_engines_shows_warning_not_crash` | 首次部署 engines 为空 → st.warning 而非 KeyError 白屏 |
-| `test_switch_causes_no_nameerror` | 切换「✨ 市场发现」无 NameError（核心回归） |
-| `test_no_cache_shows_warning_with_guidance` | 无缓存时显示扫描引导，而非空白页面 |
-| `test_fresh_cache_renders_four_metrics` | 有缓存时渲染 4 个汇总 metric |
-| `test_switch_back_to_position_mode_has_no_exception` | 来回切换模式始终无崩溃 |
+| `test_empty_engines_shows_warning_not_crash` | 首次部署 engines 空 → st.warning 非 KeyError 白屏 |
+| `test_switch_causes_no_nameerror` | 切换「市场发现」无 NameError（核心回归） |
+| `test_no_cache_shows_warning_with_guidance` | 无缓存时显示引导 |
+| `test_fresh_cache_renders_four_metrics` | 有缓存时渲染 4 个 metric |
+| `test_switch_back_to_position_mode_has_no_exception` | 来回切换始终无崩溃 |
 
-### 已发现并修复的真实 Bug
+### 已修复的真实 Bug
 
-| # | 严重度 | 触发场景 | 症状 | 根因 | 修复 commit |
-|---|--------|---------|------|------|------------|
-| 1 | 🔴 严重 | 点击「✨ 市场发现」 | 整页白屏 | `with tab_magic:` 因上方 `return` 被跳过，神奇公式从不渲染 | b8b6fe3 |
-| 2 | 🔴 严重 | 切换「市场发现」模式 | `NameError` | `_render_magic_formula_tab` 定义在 `if __name__==__main__: main()` **之后** | 904d5a4 |
-| 3 | 🟡 中等 | 首次部署 / 删除 state.json | `KeyError: '01336'` 整页崩溃 | `engine = engines[code]` 无保护，monitor 未运行时 `engines` 为空 `{}` | 67c3386 |
-| 4 | 🟠 较高 | 多次追加导入块 | 模块符号重复注册 | 两个 `from magic_formula import` 并存 | b8b6fe3 |
-
-> **Bug #3 是写 AppTest 时直接发现的**：将 `build_engines` fixture mock 为 `{}`（真实首次部署状态），
-> AppTest 立即暴露 `KeyError`。这正是 UI 交互测试相比单纯单元测试的额外价值所在。
+| # | 严重度 | 症状 | 根因 | commit |
+|---|--------|------|------|--------|
+| 1 | 🔴 | 点击「市场发现」整页白屏 | `tab_magic` 因上方 `return` 从不渲染 | b8b6fe3 |
+| 2 | 🔴 | 切换模式 `NameError` | `_render_magic_formula_tab` 定义在 `main()` 之后 | 904d5a4 |
+| 3 | 🟡 | 首次部署 `KeyError: '01336'` | `engines[code]` 无保护 | 67c3386 |
+| 4 | 🟠 | 模块符号重复注册 | 两个 `from magic_formula import` 并存 | b8b6fe3 |
 
 ---
 
@@ -248,9 +279,21 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 
 ---
 
-## 七、后续改进方向
+## 七、版本历史
+
+| 版本 | 核心改动 |
+|------|---------|
+| **v2.6** | 🛡️ 价格硬拦截（三通道均发散→return None）· ROE 稳定性监控（10年趋势+峰值跌幅）· `trading_mode` 字段 · +21 条测试（348 passed） |
+| **v2.5.1** | 🔧 双模式导航 Bug 修复 · engines 空值保护 · AppTest 7 条 UI 交互测试 |
+| **v2.5** | ✨ 神奇公式全市场扫描器（ROC+EY 双因子，A+H 股并行，日缓存） |
+| **v2.4** | 📊 5-10 年估值锚点（PB/DY 历史分位熔断+钝化）· Watcher 观察者模式 |
+
+---
+
+## 八、后续改进方向
 
 ### 🔧 功能层面
+- [ ] **ROE 稳定性看板集成**：将 `compute_roe_stability` 结果显示在单股详情卡片（`⚠️` 报警标签）
 - [ ] **PB 实时获取**：目前 PB 熔断依赖历史缓存，可增加实时 PB 触发熔断
 - [ ] **Watcher 推送去重**：加 1 小时 cooldown，避免同一机会重复推送
 - [ ] **历史成交记录**：卖出后持久化到 SQLite 并展示收益曲线
