@@ -8,6 +8,7 @@ magic_formula.py — 格林布拉特"神奇公式"全市场扫描器 v2.5
   综合排名 = ROC排名 + EY排名 → 取前 top_n
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -45,6 +46,36 @@ _USER_AGENTS = [
 ]
 
 _PROXY_RETRY_LIMIT = 3  # ProxyError 最大重试次数
+
+# 代理环境变量键名（清除时使用）
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+    "ALL_PROXY", "all_proxy",
+)
+
+
+@contextlib.contextmanager
+def _no_proxy_ctx():
+    """
+    临时清除系统代理环境变量，让 akshare 直连目标服务器。
+
+    akshare 内部使用 requests，代理由 os.environ 的 HTTP_PROXY /
+    HTTPS_PROXY 决定。代理故障时，直接清除即可让 akshare 绕过代理。
+    os.environ 在进程内所有线程共享，因此 ThreadPoolExecutor 内的
+    akshare 调用也会受益。
+    """
+    saved = {k: os.environ.pop(k, None) for k in _PROXY_ENV_KEYS}
+    proxy_list = [k for k, v in saved.items() if v is not None]
+    if proxy_list:
+        logger.info("代理免疫：临时清除代理环境变量 %s，akshare 将直连", proxy_list)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+        if proxy_list:
+            logger.info("代理免疫：已恢复代理环境变量")
 
 
 def _random_headers(extra: Optional[dict] = None) -> dict:
@@ -690,58 +721,59 @@ def scan_magic_formula(
             progress_callback(pct, msg)
         logger.info("[%.0f%%] %s", pct * 100, msg)
 
-    # Step 1: 构建股票宇宙
-    _progress(0.02, "获取金融行业黑名单…")
-    financial_codes = fetch_financial_codes_a()
+    with _no_proxy_ctx():
+        # Step 1: 构建股票宇宙
+        _progress(0.02, "获取金融行业黑名单…")
+        financial_codes = fetch_financial_codes_a()
 
-    _progress(0.05, "获取 A 股宇宙…")
-    universe_a = fetch_universe_a(financial_codes)
+        _progress(0.05, "获取 A 股宇宙…")
+        universe_a = fetch_universe_a(financial_codes)
 
-    universe_h: list[dict] = []
-    if include_h:
-        _progress(0.09, "获取 H 股宇宙…")
-        universe_h = fetch_universe_h()
+        universe_h: list[dict] = []
+        if include_h:
+            _progress(0.09, "获取 H 股宇宙…")
+            universe_h = fetch_universe_h()
 
-    universe = universe_a + universe_h
-    total = len(universe)
-    _progress(0.12, f"候选宇宙：A股 {len(universe_a)} + H股 {len(universe_h)} = {total} 只")
+        universe = universe_a + universe_h
+        total = len(universe)
+        _progress(0.12, f"候选宇宙：A股 {len(universe_a)} + H股 {len(universe_h)} = {total} 只")
 
-    if total == 0:
-        return {"top_stocks": [], "scanned_count": 0, "universe_size": 0}
+        if total == 0:
+            return {"top_stocks": [], "scanned_count": 0, "universe_size": 0}
 
-    # Step 2: 获取 AH 溢价
-    _progress(0.14, "获取 AH 溢价数据…")
-    ah_map = fetch_ah_premium_map()
+        # Step 2: 获取 AH 溢价
+        _progress(0.14, "获取 AH 溢价数据…")
+        ah_map = fetch_ah_premium_map()
 
-    # Step 3: 并行获取财务数据
-    valid_scores: list[StockScore] = []
-    completed = 0
+        # Step 3: 并行获取财务数据
+        valid_scores: list[StockScore] = []
+        completed = 0
 
-    def _worker(stock: dict) -> Optional[StockScore]:
-        fn = fetch_financials_a if stock["market"] == "A" else fetch_financials_h
-        score = fn(stock)
-        if score is not None and stock["market"] == "H":
-            score.ah_discount_pct = ah_map.get(score.code)
-        return score
+        def _worker(stock: dict) -> Optional[StockScore]:
+            fn = fetch_financials_a if stock["market"] == "A" else fetch_financials_h
+            score = fn(stock)
+            if score is not None and stock["market"] == "H":
+                score.ah_discount_pct = ah_map.get(score.code)
+            return score
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_worker, s): s for s in universe}
-        for future in as_completed(futures):
-            completed += 1
-            result = future.result()
-            if result is not None:
-                valid_scores.append(result)
-            if completed % 100 == 0 or completed == total:
-                pct = 0.14 + 0.76 * completed / total
-                _progress(pct, f"财务获取 {completed}/{total}，有效 {len(valid_scores)} 只")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_worker, s): s for s in universe}
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                if result is not None:
+                    valid_scores.append(result)
+                if completed % 100 == 0 or completed == total:
+                    pct = 0.14 + 0.76 * completed / total
+                    _progress(pct, f"财务获取 {completed}/{total}，有效 {len(valid_scores)} 只")
 
-    logger.info("有效财务数据: %d 只", len(valid_scores))
+        logger.info("有效财务数据: %d 只", len(valid_scores))
 
-    # Step 4: 排名与筛选
-    _progress(0.92, "计算综合排名…")
-    top_stocks = rank_and_select(valid_scores, top_n=top_n)
+        # Step 4: 排名与筛选
+        _progress(0.92, "计算综合排名…")
+        top_stocks = rank_and_select(valid_scores, top_n=top_n)
 
-    _progress(1.0, f"扫描完成：Top {len(top_stocks)} 只神奇公式股票")
+        _progress(1.0, f"扫描完成：Top {len(top_stocks)} 只神奇公式股票")
 
     output = {
         "top_stocks": [s.to_dict() for s in top_stocks],

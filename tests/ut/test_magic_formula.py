@@ -688,3 +688,65 @@ class TestFinancialCodesStaticFallback:
         # 有部分成功 → 返回网络数据，不是静态兜底
         assert result != _STATIC_FINANCIAL_CODES
         assert "600036" in result
+
+
+
+class TestNoProxyCtx:
+    """验证 _no_proxy_ctx 能正确清除并恢复代理环境变量。"""
+
+    def test_clears_proxy_env_vars_during_execution(self):
+        """执行期间代理环境变量应被清除。"""
+        import os
+        from magic_formula import _no_proxy_ctx
+
+        os.environ["HTTPS_PROXY"] = "http://proxy.example.com:8080"
+        try:
+            with _no_proxy_ctx():
+                assert "HTTPS_PROXY" not in os.environ
+                assert "HTTP_PROXY" not in os.environ
+        finally:
+            os.environ.pop("HTTPS_PROXY", None)
+
+    def test_restores_proxy_env_vars_after_execution(self):
+        """退出 context manager 后代理变量必须恢复。"""
+        import os
+        from magic_formula import _no_proxy_ctx
+
+        os.environ["HTTP_PROXY"] = "http://proxy.example.com:3128"
+        os.environ["HTTPS_PROXY"] = "http://proxy.example.com:3128"
+        try:
+            with _no_proxy_ctx():
+                pass
+            assert os.environ["HTTP_PROXY"] == "http://proxy.example.com:3128"
+            assert os.environ["HTTPS_PROXY"] == "http://proxy.example.com:3128"
+        finally:
+            os.environ.pop("HTTP_PROXY", None)
+            os.environ.pop("HTTPS_PROXY", None)
+
+    def test_restores_on_exception(self):
+        """即使内部抛异常，代理变量也必须恢复（RAII 保证）。"""
+        import os
+        from magic_formula import _no_proxy_ctx
+
+        os.environ["HTTPS_PROXY"] = "http://proxy.example.com:8080"
+        try:
+            with _no_proxy_ctx():
+                raise RuntimeError("simulated failure")
+        except RuntimeError:
+            pass
+        finally:
+            restored = os.environ.pop("HTTPS_PROXY", None)
+            assert restored == "http://proxy.example.com:8080", "代理变量未恢复"
+
+    def test_no_proxy_set_is_noop(self):
+        """无代理环境变量时，context manager 应静默无副作用。"""
+        import os
+        from magic_formula import _no_proxy_ctx
+
+        for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ.pop(k, None)
+
+        with _no_proxy_ctx():
+            assert "HTTPS_PROXY" not in os.environ
+        # 退出后仍无代理变量（不应凭空创建）
+        assert "HTTPS_PROXY" not in os.environ
