@@ -4,6 +4,7 @@ app.py - ValueShield v2.4
 """
 
 import json
+import logging
 import os
 
 import streamlit as st
@@ -43,6 +44,8 @@ from magic_formula import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Apple/SaaS 亮色主题 CSS
@@ -233,8 +236,11 @@ def render_sidebar(config: dict, state: dict) -> str:
         st.markdown('<hr class="lv-hr">', unsafe_allow_html=True)
 
         if app_mode == "✨ 市场发现":
+            logger.debug("sidebar: 用户切换到「市场发现」模式 → 返回 __discovery__")
             st.caption("神奇公式全市场扫描")
             return "__discovery__"
+
+        logger.debug("sidebar: 用户停留在「仓位管理」模式")
 
         # ── 📊 当前持仓
         st.markdown(
@@ -425,8 +431,11 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     # ── 顶级模式路由：市场发现模式全屏展示神奇公式
     if selected_code == "__discovery__":
+        logger.debug("main: 进入市场发现模式，调用 _render_magic_formula_tab")
         _render_magic_formula_tab(config, state)
         return
+
+    logger.debug("main: 仓位管理模式，selected_code=%s", selected_code)
 
     # v2.4 风险计算：优先使用预算公式，退化用网格压力测试
     current_prices = state.get("latest_prices", {})
@@ -1144,9 +1153,6 @@ def _render_watcher_card(watcher_cfg: dict, state: dict, config: dict, engines: 
                 st.rerun()
 
 
-if __name__ == "__main__":
-    main()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ✨ 神奇公式 Top 30 标签页
@@ -1202,7 +1208,16 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
 
     # ── 展示 Top 30
     if not cache or not cache.get("top_stocks"):
-        st.info("暂无数据，请先扫描。")
+        logger.warning("_render_magic_formula_tab: 缓存为空或 top_stocks 为空列表")
+        st.warning(
+            "⚠️ 暂无神奇公式数据。\n\n"
+            "可能原因：\n"
+            "- 首次使用，尚未执行扫描\n"
+            "- 扫描过程中网络/代理异常，导致结果集为空\n"
+            "- AkShare 接口返回格式变更\n\n"
+            "**请点击上方「🔄 重新扫描全市场」按钮**，并观察进度条是否有数据返回。\n"
+            "若扫描完成后仍为空，请检查网络连接或代理设置。"
+        )
         return
 
     top_stocks = [StockScore.from_dict(d) for d in cache["top_stocks"]]
@@ -1320,3 +1335,8 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
                     f"（以上数据来自最新年报/季报，请结合定性分析使用）"
                 )
                 st.code(summary, language=None)
+
+if __name__ == "__main__":
+    main()
+
+
