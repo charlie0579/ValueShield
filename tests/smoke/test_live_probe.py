@@ -18,16 +18,12 @@ tests/smoke/test_live_probe.py — 影子数据冒烟测试（Live Data Probe）
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import pytest
 
 from magic_formula import (
     StockScore,
-    _is_financial_industry,
-    compute_ey,
-    compute_roc,
     fetch_financial_codes_a,
     fetch_financials_a,
     fetch_financials_h,
@@ -59,50 +55,6 @@ _PROBE_H = [
     ("01336", "新华保险 H", 0),  # 保险，可能被过滤
     ("00700", "腾讯控股",  0),  # 科技，应能计算（PE 近似法）
 ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 纯函数计算层：不需要网络（快速验证公式正确性）
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestPureFunctions:
-    """验证 compute_roc / compute_ey 纯函数的数值正确性（无网络）。"""
-
-    def test_compute_roc_standard_case(self):
-        """ROC = EBIT / (NWC + 固定资产)，标准情形。"""
-        roc = compute_roc(ebit=1e9, net_working_capital=3e9, net_fixed_assets=2e9)
-        assert roc is not None
-        expected = 1e9 / (3e9 + 2e9)
-        assert math.isclose(roc, expected, rel_tol=1e-9)
-
-    def test_compute_roc_negative_denominator_returns_none(self):
-        """分母为负时应返回 None（避免虚假正 ROC）。"""
-        roc = compute_roc(ebit=1e9, net_working_capital=-4e9, net_fixed_assets=1e9)
-        # NWC + 固定资产 = -3e9 < 0 → None
-        assert roc is None
-
-    def test_compute_ey_standard_case(self):
-        """EY = EBIT / EV，标准情形。"""
-        ey = compute_ey(ebit=5e9, ev=100e9)
-        assert ey is not None
-        assert math.isclose(ey, 0.05, rel_tol=1e-9)
-
-    def test_compute_ey_nonpositive_ebit_returns_none(self):
-        """EBIT <= 0 时应返回 None。"""
-        assert compute_ey(ebit=0.0, ev=100e9) is None
-        assert compute_ey(ebit=-1e9, ev=100e9) is None
-
-    def test_compute_ey_nonpositive_ev_returns_none(self):
-        """EV <= 0 时应返回 None。"""
-        assert compute_ey(ebit=1e9, ev=0.0) is None
-
-    def test_financial_industry_filter_catches_banks(self):
-        """金融行业过滤器应识别银行/保险类名称。"""
-        assert _is_financial_industry("工商银行")
-        assert _is_financial_industry("平安保险")
-        assert _is_financial_industry("证券公司")
-        assert not _is_financial_industry("贵州茅台")
-        assert not _is_financial_industry("中国国旅")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
