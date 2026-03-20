@@ -215,15 +215,26 @@ streamlit run app.py --server.port 8502 --server.address 0.0.0.0
 |------|------|---------|---------|
 | **单元测试** | `tests/ut/` | 每次 commit（自动）| mock 所有 I/O，毫秒级 |
 | **UI 交互测试** | `tests/ut/test_app_ui.py` | 每次 commit（自动）| AppTest 防止渲染路径断裂 |
-| **影子数据冒烟** | `tests/smoke/` | 手动（有网络时）| 真实 AkShare 接口验活 |
+| **影子数据冒烟** | `tests/smoke/` | 手动（见下方运行时机）| 真实 AkShare 接口验活 |
 
 ```bash
-# 常规 CI（无需网络，348 个测试，约 13s）
+# 常规 CI（无需网络，364 个测试，约 25s）
 python3.12 -m pytest tests/ -q
 
-# AkShare 接口验活
+# AkShare 接口验活（smoke，需真实网络，10 条）
 python3.12 -m pytest -m smoke tests/smoke/ -v
 ```
+
+#### Smoke 测试的运行时机
+
+Smoke 测试（10 条）验证真实 AkShare 网络接口，与 Ollama / 大模型无关，在以下场景**手动触发**：
+
+| 场景 | 原因 |
+|------|------|
+| 修改 `magic_formula.py` 中的 AkShare 接口调用后 | 验证 A/H 股数据适配未断裂 |
+| 收到「数据为空」的用户反馈后 | 定位 AkShare API 是否失效 |
+| 节假日后首个交易日 | 验证接口未在假期维护中变更 |
+| 定期健康检查（建议每月一次）| 提前发现接口格式变更 |
 
 ### 测试覆盖率
 
@@ -233,9 +244,9 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 | notifier.py | **100%** | 买入 / 卖出 / 风险预警 / 建仓机会推送全覆盖 |
 | monitor.py | **89%** | 主监控循环、节假日判断、E2E 通知链 |
 | magic_formula.py | **91%** | ROC/EY 计算、缓存读写、并行扫描 |
-| crawler.py | **76%** | 三通道行情 + 价格硬拦截 + ROE 稳定性 + 估值分位 |
+| crawler.py | **88%** | 三通道行情 + 价格硬拦截 + ROE 稳定性 + DCF + 估值分位 |
 
-**348 passed**（16 smoke 测试自动排除，`-m "not smoke"`）
+**364 passed，10 deselected**（smoke 测试需真实网络，通过 `-m "not smoke"` 自动排除）
 
 ### v2.6 新增测试（+21）
 
@@ -246,6 +257,15 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 | `TestPercentileAccuracy` | test_crawler.py | 6 | 中位/极值/低优先/越界截断/数据不足返回 -1 |
 | `TestNotificationChain` | test_monitor.py | 3 | E2E：价格触发→pending 写入、无触发、None 不写 state |
 
+### v2.6.1 新增测试（+16）
+
+| 类 | 文件 | 数 | 覆盖场景 |
+|---|---|---|---|
+| `TestDCFValue` | test_crawler.py | 6 | 公式验证、空数据/负值返回 None、自定义参数、years 字段、必要 key |
+| `TestFetchOperatingCF` | test_crawler.py | 2 | A 股接口异常回退空列表、空 DataFrame 回退 |
+| `TestROEBadgeAndExpander` | test_app_ui.py | 4 | 衰减不崩溃、expander 含 ROE、稳定无"衰减"字样、无历史无 expander |
+| `TestDCFInMagicFormulaSummary` | test_app_ui.py | 4 | DCF 有数据不崩溃、None 不崩溃、st.code 含"DCF"、兜底文案"暂无现金流" |
+
 ### AppTest 覆盖的核心路径
 
 | 测试用例 | 验证内容 |
@@ -253,10 +273,18 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 | `test_first_run_has_no_exception` | 首次渲染无任何异常 |
 | `test_sidebar_radio_exists_with_two_options` | 侧边栏 radio 含两个导航选项 |
 | `test_empty_engines_shows_warning_not_crash` | 首次部署 engines 空 → st.warning 非 KeyError 白屏 |
-| `test_switch_causes_no_nameerror` | 切换「市场发现」无 NameError（核心回归） |
+| `test_switch_causes_no_nameerror` | 切换「市场发现」无 NameError（核心回归）|
 | `test_no_cache_shows_warning_with_guidance` | 无缓存时显示引导 |
 | `test_fresh_cache_renders_four_metrics` | 有缓存时渲染 4 个 metric |
 | `test_switch_back_to_position_mode_has_no_exception` | 来回切换始终无崩溃 |
+| `test_declining_roe_renders_without_exception` | ROE 连续下跌 badge 渲染不崩溃 |
+| `test_roe_expander_visible_when_history_present` | 有历史时 expander label 含"ROE" |
+| `test_stable_roe_shows_neutral_expander_label` | 稳定时 label 不含"衰减" |
+| `test_no_roe_history_no_roe_expander` | 无历史时无 ROE expander（回归保护）|
+| `test_dcf_with_mock_data_no_exception` | DCF 有数据渲染不崩溃 |
+| `test_dcf_none_still_renders_gracefully` | DCF 返回 None 不崩溃 |
+| `test_dcf_line_appears_in_code_block` | st.code 摘要含"DCF"字样 |
+| `test_dcf_fallback_text_when_no_cashflow` | 无现金流时含"暂无现金流"兜底文案 |
 
 ### 已修复的真实 Bug
 
@@ -283,7 +311,8 @@ python3.12 -m pytest -m smoke tests/smoke/ -v
 
 | 版本 | 核心改动 |
 |------|---------|
-| **v2.6.1** | 🔨 ROE 稳定性 UI 看板（⚠️ badge + 10 年趋势 expander）· DCF 简易估值（Gordon Growth）· monitor ROE 历史写入 · +8 条测试（356 passed） |
+| **v2.6.2** | 🧹 smoke 整理：移除被误标的 TestPureFunctions（已在 UT 覆盖），deselected 16→10 · ROE badge/DCF AppTest 覆盖（364 passed） |
+| **v2.6.1** | 🔨 ROE 稳定性 UI 看板（⚠️ badge + 10 年趋势 expander）· DCF 简易估值（Gordon Growth）· monitor ROE 历史写入 · +16 条测试 |
 | **v2.6** | 🛡️ 价格硬拦截（三通道均发散→return None）· ROE 稳定性监控（10年趋势+峰值跌幅）· `trading_mode` 字段 · +21 条测试（348 passed） |
 | **v2.5.1** | 🔧 双模式导航 Bug 修复 · engines 空值保护 · AppTest 7 条 UI 交互测试 |
 | **v2.5** | ✨ 神奇公式全市场扫描器（ROC+EY 双因子，A+H 股并行，日缓存） |
