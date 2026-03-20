@@ -1,4 +1,4 @@
-# ValueShield — H股价值投资管家 v2.4
+# ValueShield — H股价值投资管家 v2.5
 
 > **设计哲学：算法为辅，主观为主；数据本地化；移动端优先。**
 >
@@ -53,6 +53,23 @@
 - 估值分位标签（PB / 股息率 emoji 实时显示）
 - 配置页"👤 一键对齐账户"expander，手动同步真实持仓
 
+### 8. ✨ 神奇公式全市场扫描器（v2.5 新增）
+- **格林布拉特双因子模型**：ROC（资本回报率）+ EY（盈利收益率）综合排名
+  - $ROC = EBIT / (净营运资本 + 净固定资产)$
+  - $EY = EBIT / EV$（EV = 市值 + 净负债）
+- **全市场覆盖**：A 股（沪深主板/创业板/科创板）+ H 股（按市值过滤）
+- **行业过滤**：自动剔除金融类股票（银行/保险/证券/信托/多元金融）
+- **双排名机制**：ROC 排名 + EY 排名 → 综合排名最低 30 只
+- **A 股**：使用实际财报数据（资产负债表 + 利润表，data_quality="full"）
+- **H 股**：优先使用财报接口，失败时退化为 PE/PB 近似（data_quality="approx"）
+- **AH 折价标识**：H 股相对 A 股折价率实时显示
+- **日缓存机制**：每日盘前自动扫描一次（`maybe_refresh_magic_formula`），结果缓存 18 小时
+- **UI 交互**：
+  - 🔄 手动触发"重新扫描全市场"（带进度条）
+  - ➕ 一键将标的加入 `watchers` 观察名单（建仓价 = 九折）
+  - 📋 复制财务摘要（可粘贴给 Gemini 进行 6+2 深度主观分析）
+
+
 ---
 
 ## 二、技术架构
@@ -63,6 +80,7 @@ ValueShield/
 ├── monitor.py      # 后台监控轮询循环（v2.4 信号逻辑 + Watcher）
 ├── engine.py       # 核心算法引擎（GridEngine + PositionSummary + WatcherTarget）
 ├── crawler.py      # 三通道行情获取 + 估值历史（PB / 股息率分位）
+├── magic_formula.py# 神奇公式全市场扫描器（ROC + EY 双因子，A+H 股）
 ├── notifier.py     # Bark API 推送（买入 / 卖出 / 风险预警 / 建仓机会）
 ├── config.json     # 静态配置（标的参数、Bark Token、watchers 列表）
 ├── state.json      # 实时持仓与网格状态（原子写入）
@@ -160,7 +178,7 @@ notifier.py  100%   买入 / 卖出 / 风险预警 / 建仓机会推送全覆盖
 monitor.py    96%   主监控循环、Watcher 循环、估值历史刷新
 crawler.py    94%   三通道行情 + 估值分位函数
 ───────────────────────────────
-TOTAL: 251 tests passed
+TOTAL: 320 tests passed (+69 神奇公式)
 ```
 
 ---

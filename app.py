@@ -33,6 +33,19 @@ from crawler import (
     get_valuation_label,
 )
 from monitor import load_config, load_state, save_state, build_engines, build_watchers
+from magic_formula import (
+    StockScore,
+    is_cache_fresh,
+    load_cache as load_mf_cache,
+    scan_magic_formula,
+)
+from magic_formula import (
+    StockScore,
+    is_cache_fresh,
+    load_cache as load_mf_cache,
+    save_cache as save_mf_cache,
+    scan_magic_formula,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -476,7 +489,9 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     pb_label = get_valuation_label(pb_pct, "PB", 0.0, unit="x") if pb_hist else ""
 
     # ── 标签页
-    tab_monitor, tab_config, tab_settings = st.tabs(["📊 实时监控", "⚙️ 网格配置", "🛠️ 系统设置"])
+    tab_monitor, tab_config, tab_settings, tab_magic = st.tabs(
+        ["📊 实时监控", "⚙️ 网格配置", "🛠️ 系统设置", "✨ 神奇公式 Top 30"]
+    )
 
     # ════════════════════════════════════════════════════════════════
     # 📊 监控页
@@ -1116,5 +1131,185 @@ def _render_watcher_card(watcher_cfg: dict, state: dict, config: dict, engines: 
                 st.rerun()
 
 
+    # ════════════════════════════════════════════════════════════════
+    # ✨ 神奇公式 Top 30
+    # ════════════════════════════════════════════════════════════════
+    with tab_magic:
+        _render_magic_formula_tab(config, state)
+
 if __name__ == "__main__":
     main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ✨ 神奇公式 Top 30 标签页
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_magic_formula_tab(config: dict, state: dict) -> None:
+    """渲染神奇公式全市场扫描看板。"""
+
+    st.markdown("### ✨ 格林布拉特神奇公式 — 全市场 Top 30 烟蒂股")
+    st.caption(
+        "算法：ROC = EBIT / (净营运资本 + 净固定资产)；EY = EBIT / EV。"
+        " A 股使用实际财报数据（full），H 股部分使用 PE/PB 近似（approx）。"
+        " 数据每日盘前自动缓存，也可手动刷新。"
+    )
+
+    cache = load_mf_cache()
+    cached_at = cache.get("cached_at", "")[:16].replace("T", " ") if cache else ""
+    fresh = cache is not None and is_cache_fresh(cache)
+
+    # ── 状态栏
+    col_info, col_btn = st.columns([7, 3])
+    with col_info:
+        if fresh and cached_at:
+            scanned = cache.get("scanned_count", 0)
+            universe = cache.get("universe_size", 0)
+            st.success(
+                f"🟢 缓存有效（{cached_at}）：扫描宇宙 {universe} 只 → "
+                f"有效财务数据 {scanned} 只"
+            )
+        elif cache and not fresh:
+            st.warning(f"🟡 缓存已过期（{cached_at}），建议重新扫描")
+        else:
+            st.info("🔵 尚无缓存，请点击 **重新扫描全市场** 开始首次扫描（约 2-5 分钟）")
+
+    with col_btn:
+        do_scan = st.button("🔄 重新扫描全市场", use_container_width=True)
+
+    # ── 执行扫描
+    if do_scan:
+        progress_bar = st.progress(0.0, text="准备开始扫描…")
+
+        def _cb(pct: float, msg: str) -> None:
+            progress_bar.progress(min(pct, 1.0), text=msg)
+
+        with st.spinner("神奇公式全市场扫描中，请耐心等待…"):
+            try:
+                cache = scan_magic_formula(top_n=30, include_h=True, progress_callback=_cb)
+                st.success("✅ 扫描完成！")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"扫描失败：{exc}")
+        return
+
+    # ── 展示 Top 30
+    if not cache or not cache.get("top_stocks"):
+        st.info("暂无数据，请先扫描。")
+        return
+
+    top_stocks = [StockScore.from_dict(d) for d in cache["top_stocks"]]
+
+    # ── 汇总指标行
+    m1, m2, m3, m4 = st.columns(4)
+    a_count = sum(1 for s in top_stocks if s.market == "A")
+    h_count = len(top_stocks) - a_count
+    avg_roc = sum(s.roc for s in top_stocks) / len(top_stocks) if top_stocks else 0.0
+    avg_ey = sum(s.ey for s in top_stocks) / len(top_stocks) if top_stocks else 0.0
+    with m1:
+        st.metric("A 股入选", a_count)
+    with m2:
+        st.metric("H 股入选", h_count)
+    with m3:
+        st.metric("平均 ROC", f"{avg_roc:.1%}")
+    with m4:
+        st.metric("平均 EY", f"{avg_ey:.1%}")
+
+    st.divider()
+
+    # ── Top 30 表格
+    for stock in top_stocks:
+        roc_str = f"{stock.roc:.1%}"
+        ey_str = f"{stock.ey:.1%}"
+        ah_str = (
+            f"H股折价 {abs(stock.ah_discount_pct):.1f}%"
+            if stock.ah_discount_pct is not None and stock.ah_discount_pct < -1
+            else "—"
+        )
+        quality_badge = "🔬" if stock.data_quality == "approx" else "✅"
+
+        with st.container(border=True):
+            row1, row2, row3 = st.columns([1, 5, 4]), st.columns([2, 2, 2, 2, 2]), st.columns([3, 3, 4])
+
+            with row1[0]:
+                st.markdown(
+                    f'<div style="font-size:1.5rem;font-weight:900;color:#6B7280;'
+                    f'text-align:center;line-height:1.8">#{stock.combined_rank}</div>',
+                    unsafe_allow_html=True,
+                )
+            with row1[1]:
+                badge_color = "#2563EB" if stock.market == "A" else "#7C3AED"
+                st.markdown(
+                    f'<span style="background:{badge_color};color:#fff;'
+                    f'font-size:0.72rem;padding:2px 6px;border-radius:4px;">{stock.market}</span>'
+                    f' <b style="font-size:1.05rem">{stock.name}</b>'
+                    f' <span style="color:#6B7280;font-size:0.85rem">{stock.code}</span>'
+                    f' {quality_badge}',
+                    unsafe_allow_html=True,
+                )
+            with row1[2]:
+                st.markdown(
+                    f'<div style="text-align:right;font-size:1.1rem;'
+                    f'font-weight:700;color:#111827;">'
+                    f'{"HKD" if stock.market == "H" else "CNY"} {stock.price:.2f}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            with row2[0]:
+                st.metric("ROC", roc_str, help="资本回报率 = EBIT / (净营运资本 + 净固定资产)")
+            with row2[1]:
+                st.metric("EY", ey_str, help="盈利收益率 = EBIT / 企业价值")
+            with row2[2]:
+                st.metric("ROC 排名", f"#{stock.roc_rank}")
+            with row2[3]:
+                st.metric("EY 排名", f"#{stock.ey_rank}")
+            with row2[4]:
+                st.metric("综合排名", f"#{stock.combined_rank}", help="综合排名 = ROC排名 + EY排名，越低越好")
+
+            with row3[0]:
+                if ah_str != "—":
+                    st.markdown(
+                        f'<span style="background:#D1FAE5;color:#065F46;'
+                        f'font-size:0.8rem;padding:3px 8px;border-radius:6px;">'
+                        f'🔀 {ah_str}</span>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption("")
+
+            with row3[1]:
+                # 一键加入观察名单
+                if st.button("➕ 加入观察", key=f"mf_watch_{stock.code}"):
+                    watchers = config.setdefault("watchers", [])
+                    if not any(w["code"] == stock.code for w in watchers):
+                        watchers.append({
+                            "code": stock.code,
+                            "name": stock.name,
+                            "akshare_code": stock.code,
+                            "base_price": round(stock.price * 0.9, 3),  # 默认安全边际 = 九折
+                            "total_budget": 0.0,
+                            "enabled": True,
+                        })
+                        from monitor import CONFIG_PATH as _CP
+                        import json as _json
+                        with open(_CP, "w", encoding="utf-8") as _f:
+                            _json.dump(config, _f, ensure_ascii=False, indent=2)
+                        st.success(f"✅ {stock.name} 已加入观察名单（建仓价 = 九折）")
+                        st.rerun()
+                    else:
+                        st.info("已在观察名单中")
+
+            with row3[2]:
+                # 复制财务摘要
+                summary = (
+                    f"【神奇公式分析摘要】{stock.name}（{stock.code}）\n"
+                    f"市场：{stock.market}股 | 现价：{stock.price:.2f}\n"
+                    f"ROC（资本回报率）：{stock.roc:.1%}（排名 #{stock.roc_rank}）\n"
+                    f"EY（盈利收益率）：{stock.ey:.1%}（排名 #{stock.ey_rank}）\n"
+                    f"综合排名：#{stock.combined_rank}\n"
+                    f"EBIT 估算：{stock.ebit/1e8:.2f} 亿\n"
+                    f"企业价值：{stock.ev/1e8:.2f} 亿\n"
+                    f"数据质量：{'实算（EBIT）' if stock.data_quality == 'full' else 'PE/PB 近似'}\n"
+                    f"（以上数据来自最新年报/季报，请结合定性分析使用）"
+                )
+                st.code(summary, language=None)

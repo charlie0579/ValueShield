@@ -309,6 +309,26 @@ def run_once(config: dict, state: dict, engines: dict[str, GridEngine], notifier
     return state
 
 
+def maybe_refresh_magic_formula(config: dict) -> None:
+    """
+    检查神奇公式缓存是否过期，若过期则在盘前自动触发一次全市场扫描。
+    由 main_loop 在每次进入交易日时调用一次。
+    失败时静默忽略，不影响主监控循环。
+    """
+    try:
+        from magic_formula import load_cache, is_cache_fresh, scan_magic_formula
+
+        cache = load_cache()
+        if cache is not None and is_cache_fresh(cache):
+            logger.info("神奇公式缓存有效，跳过盘前扫描")
+            return
+        logger.info("神奇公式缓存过期或不存在，开始盘前自动扫描…")
+        scan_magic_formula(top_n=30, include_h=True)
+        logger.info("神奇公式盘前扫描完成")
+    except Exception as exc:
+        logger.warning("神奇公式盘前扫描失败（不影响主循环）: %s", exc)
+
+
 def main_loop() -> None:
     """主监控循环入口，供 `python monitor.py` 直接运行。"""
     config = load_config()
@@ -336,6 +356,7 @@ def main_loop() -> None:
             time.sleep(60)
             continue
 
+        maybe_refresh_magic_formula(config)
         state = load_state()
         engines = build_engines(config, state)
 
