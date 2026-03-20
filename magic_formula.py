@@ -721,7 +721,8 @@ def scan_magic_formula(
             progress_callback(pct, msg)
         logger.info("[%.0f%%] %s", pct * 100, msg)
 
-    with _no_proxy_ctx():
+    def _run_scan() -> dict:
+        """核心扫描逻辑，可在有/无代理的 context 下调用。"""
         # Step 1: 构建股票宇宙
         _progress(0.02, "获取金融行业黑名单…")
         financial_codes = fetch_financial_codes_a()
@@ -760,9 +761,9 @@ def scan_magic_formula(
             futures = {executor.submit(_worker, s): s for s in universe}
             for future in as_completed(futures):
                 completed += 1
-                result = future.result()
-                if result is not None:
-                    valid_scores.append(result)
+                scan_result = future.result()
+                if scan_result is not None:
+                    valid_scores.append(scan_result)
                 if completed % 100 == 0 or completed == total:
                     pct = 0.14 + 0.76 * completed / total
                     _progress(pct, f"财务获取 {completed}/{total}，有效 {len(valid_scores)} 只")
@@ -775,10 +776,22 @@ def scan_magic_formula(
 
         _progress(1.0, f"扫描完成：Top {len(top_stocks)} 只神奇公式股票")
 
-    output = {
-        "top_stocks": [s.to_dict() for s in top_stocks],
-        "scanned_count": len(valid_scores),
-        "universe_size": total,
-    }
+        return {
+            "top_stocks": [s.to_dict() for s in top_stocks],
+            "scanned_count": len(valid_scores),
+            "universe_size": total,
+        }
+
+    # 第一次：尊重当前环境代理配置（有代理走代理，无代理直连）
+    output = _run_scan()
+
+    # 若宇宙为空且检测到代理配置，代理可能是故障原因，尝试直连重试
+    _has_proxy = any(os.environ.get(k) for k in _PROXY_ENV_KEYS)
+    if output.get("universe_size", 0) == 0 and _has_proxy:
+        logger.warning("宇宙为空且检测到代理配置，尝试直连重试…")
+        _progress(0.03, "代理疑似故障，切换直连重试…")
+        with _no_proxy_ctx():
+            output = _run_scan()
+
     save_cache(output)
     return output

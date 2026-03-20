@@ -592,6 +592,63 @@ class TestScanMagicFormula:
         finally:
             mf.CACHE_PATH = orig_path
 
+    def test_retries_without_proxy_when_universe_empty_and_proxy_set(
+        self, monkeypatch, tmp_path
+    ):
+        """若宇宙为空且检测到代理配置，应切换直连重试第二次。"""
+        import magic_formula as mf
+
+        orig_path = mf.CACHE_PATH
+        mf.CACHE_PATH = str(tmp_path / "cache.json")
+        monkeypatch.setenv("HTTP_PROXY", "http://broken-proxy:8080")
+        call_count = {"n": 0}
+
+        def _side_effect(financial_codes):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return []  # 第一次：代理故障，宇宙为空
+            return [
+                {
+                    "code": "000001",
+                    "name": "股票A",
+                    "market": "A",
+                    "current_price": 10.0,
+                    "total_cap": 50e9,
+                    "pe": 12.0,
+                }
+            ]
+
+        try:
+            with patch("magic_formula.fetch_universe_a", side_effect=_side_effect),                     patch("magic_formula.fetch_financial_codes_a", return_value=[]),                     patch("magic_formula.fetch_financials_a", return_value=None),                     patch("magic_formula.fetch_ah_premium_map", return_value={}),                     patch("magic_formula.rank_and_select", return_value=[]):
+                result = scan_magic_formula(include_h=False, top_n=1)
+            assert call_count["n"] == 2, "应触发直连重试（fetch_universe_a 被调用两次）"
+            assert result["universe_size"] == 1
+        finally:
+            mf.CACHE_PATH = orig_path
+
+    def test_no_retry_when_universe_empty_without_proxy(self, monkeypatch, tmp_path):
+        """若宇宙为空但无代理配置，不应触发直连重试。"""
+        import magic_formula as mf
+
+        orig_path = mf.CACHE_PATH
+        mf.CACHE_PATH = str(tmp_path / "cache.json")
+        for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.delenv(k, raising=False)
+        call_count = {"n": 0}
+
+        def _side_effect(financial_codes):
+            call_count["n"] += 1
+            return []
+
+        try:
+            with patch("magic_formula.fetch_universe_a", side_effect=_side_effect),                     patch("magic_formula.fetch_financial_codes_a", return_value=[]):
+                result = scan_magic_formula(include_h=False, top_n=1)
+            assert call_count["n"] == 1, "无代理时不应重试"
+            assert result["universe_size"] == 0
+        finally:
+            mf.CACHE_PATH = orig_path
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
