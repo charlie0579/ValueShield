@@ -496,7 +496,15 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     code = stock_cfg["code"]
     name = stock_cfg["name"]
-    engine = engines[code]
+    engine = engines.get(code)
+    if engine is None:
+        st.warning(
+            f"⚠️ 标的 **{name}**（{code}）尚未初始化引擎。\n\n"
+            "通常原因：首次部署或 `state.json` 被重置，`monitor.py` 还未运行一次。\n"
+            "请先启动后台监控服务：`python3.12 monitor.py`，等待第一次轮询完成后刷新页面。"
+        )
+        logger.warning("main: engines 中不存在 %s，跳过渲染（首次部署？）", code)
+        return
     current_price = state.get("latest_prices", {}).get(code)
     annual_div = state.get("latest_dividend_ttm", {}).get(code, stock_cfg.get("annual_dividend_hkd", 0.0))
     div_yield = compute_dividend_yield(annual_div, current_price) if current_price else 0.0

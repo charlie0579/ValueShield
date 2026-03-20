@@ -177,6 +177,30 @@ class TestPositionManagementMode:
         finally:
             _stop_patches(patchers)
 
+    def test_empty_engines_shows_warning_not_crash(self):
+        """
+        【真实 Bug 回归】首次部署 / state.json 被删除 → engines 为空 {}
+        旧代码：engines["01336"] → KeyError，整页白屏
+        新代码：engines.get("01336") → None → st.warning 给出引导提示
+        """
+        patchers = _start_patches(extra={"monitor.build_engines": {}})
+        try:
+            at = AppTest.from_file(APP_PY, default_timeout=30)
+            at.run()
+            # 不应有未捕获异常
+            assert not at.exception, (
+                f"engines 为空时应显示 warning 而非崩溃，实际异常：{at.exception}"
+            )
+            # 应显示含「引擎」或「monitor」关键字的 warning
+            warning_texts = [w.value for w in at.warning]
+            assert any(
+                kw in text
+                for text in warning_texts
+                for kw in ("初始化", "monitor", "monitor.py", "引擎", "state.json")
+            ), f"engines 为空时未显示引导 warning，实际：{warning_texts!r}"
+        finally:
+            _stop_patches(patchers)
+
 
 class TestDiscoveryModeSwitch:
     """

@@ -1,4 +1,4 @@
-# ValueShield — H股价值投资管家 v2.5
+# ValueShield — H股价值投资管家 v2.5.1
 
 > **设计哲学：算法为辅，主观为主；数据本地化；移动端优先。**
 >
@@ -47,7 +47,9 @@
 - 20% 偏差校验：三通道结果相互验证，异常时记录警告 + 保留上次有效价
 
 ### 7. Web 看板（同花顺风格）
-- 侧边栏双分组：📊 **当前持仓**（显示浮盈 %）+ 🔍 **观察名单**（显示距建仓价 %）
+- 侧边栏顶部：**📈 仓位管理 / ✨ 市场发现** 双模式切换（radio，水平排布）
+  - 「仓位管理」：双分组列表 📊 **当前持仓** + 🔍 **观察名单**
+  - 「市场发现」：全屏神奇公式看板（独立模式，不共享标签页层级）
 - 圆角卡片布局，支持深色/浅色主题
 - 持仓详情：PositionSummary 5 列卡片（总股 / 均价 / 现价 / 浮盈 / 市值）+ 预算进度条
 - 估值分位标签（PB / 股息率 emoji 实时显示）
@@ -86,7 +88,10 @@ ValueShield/
 ├── state.json      # 实时持仓与网格状态（原子写入）
 ├── requirements.txt
 └── tests/
-    ├── ut/         # 单元测试（251 个，engine 100% / notifier 100% 覆盖）
+    ├── ut/         # 单元测试（327 个，engine 100% / notifier 100% 覆盖）
+    │   ├── test_app_ui.py   # Streamlit AppTest UI 交互测试（7 个）
+    │   └── ...              # 各模块单元测试
+    ├── smoke/      # 影子数据冒烟测试（需真实网络，手动运行）
     └── sct/        # 场景测试（端到端完整交易流程）
 ```
 
@@ -162,8 +167,11 @@ streamlit run app.py --server.port 8502
 nohup python3.12 monitor.py > monitor.log 2>&1 &
 streamlit run app.py --server.port 8502 --server.address 0.0.0.0
 
-# 运行全套单元测试
+# 运行全套单元测试（自动排除需要网络的 smoke 测试）
 python3.12 -m pytest tests/ -q
+
+# 运行影子数据冒烟测试（需联网，验证 AkShare 接口是否正常）
+python3.12 -m pytest -m smoke tests/smoke/ -v
 ```
 
 **首次配置：** 编辑 `config.json`，填入 `bark_token` 和 `web_server_url`（局域网 IP）。
@@ -175,15 +183,56 @@ python3.12 -m pytest tests/ -q
 ```
 engine.py    100%   GridEngine / PositionSummary / WatcherTarget 全覆盖
 notifier.py  100%   买入 / 卖出 / 风险预警 / 建仓机会推送全覆盖
-monitor.py    96%   主监控循环、Watcher 循环、估值历史刷新
+monitor.py    89%   主监控循环、Watcher 循环、估值历史刷新
 crawler.py    94%   三通道行情 + 估值分位函数
+magic_formula.py 91% 神奇公式扫描器（ROC/EY计算、缓存、宇宙构建）
 ───────────────────────────────
-TOTAL: 320 tests passed (+69 神奇公式)
+TOTAL: 327 tests passed（16 smoke 测试在 CI 中自动排除）
 ```
 
 ---
 
-## 七、后续改进方向
+## 七、测试策略与已发现的真实 Bug
+
+### 三层测试体系
+
+| 层次 | 位置 | 运行时机 | 说明 |
+|------|------|---------|------|
+| **单元测试** | `tests/ut/` | 每次提交（自动）| mock 所有外部 I/O，毫秒级完成 |
+| **UI 交互测试** | `tests/ut/test_app_ui.py` | 每次提交（自动）| Streamlit AppTest，模拟用户点击 |
+| **影子数据冒烟** | `tests/smoke/` | 手动（有网络时）| 真实 AkShare 接口验证 |
+
+```bash
+# 常规 CI（无需网络）
+python3.12 -m pytest tests/ -q
+
+# 接口验活（AkShare 格式变更后）
+python3.12 -m pytest -m smoke tests/smoke/ -v
+```
+
+### AppTest 覆盖的核心交互路径
+
+- 默认「仓位管理」模式正常渲染
+- 切换到「✨ 市场发现」模式 → **无 NameError**（核心回归）
+- 无缓存时显示扫描引导 warning，而非空白页面
+- 有缓存时渲染 4 个汇总 metric（A股入选/H股入选/平均ROC/EY）
+- 来回切换模式始终无崩溃
+- **engines 为空时显示友好提示，而非 KeyError 白屏**（首次部署场景）
+
+### 测试过程中发现的真实 Bug 记录
+
+| # | 严重度 | 触发场景 | 症状 | 根因 | 修复版本 |
+|---|--------|---------|------|------|--------|
+| 1 | 🔴 严重 | 点击「✨ 市场发现」 | 整页白屏 | `tab_magic` 变量因 `return` 语句被跳过，`with tab_magic:` 从不执行 | v2.5.1 b8b6fe3 |
+| 2 | 🔴 严重 | 切换「市场发现」模式 | `NameError: _render_magic_formula_tab` | 函数定义在 `if __name__==__main__: main()` **之后**，首次调用时函数尚未定义 | v2.5.1 904d5a4 |
+| 3 | 🟡 中等 | 首次部署 / 删除 state.json | `KeyError: '01336'` 整页崩溃 | `engine = engines[code]` 无保护，`engines` 在 monitor 未运行时为空 `{}` | v2.5.1 当前 |
+| 4 | 🟠 较高 | 多次追加 `from magic_formula import` | 模块重复导入 | 两个 `from magic_formula import` 块并存，`StockScore` 等被重复注册 | v2.5.1 b8b6fe3 |
+
+> **Bug #3 是本次测试写作直接发现的**：在为 AppTest 编写 fixture 时，将 `build_engines` mock 为 `{}`（首次部署的真实状态），发现 `engines[code]` 直接抛出 `KeyError`。已修复为 `engines.get(code)` + 友好提示。
+
+---
+
+## 八、后续改进方向
 
 ### 🔧 功能层面
 - [ ] **PB 实时获取**：目前 PB 熔断依赖历史缓存（`refresh_valuation_history`），可增加实时 PB 抓取触发熔断
