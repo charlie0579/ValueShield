@@ -246,10 +246,13 @@ class TestFetchFinancialCodesA:
         assert "000001" in codes
         assert isinstance(codes, frozenset)
 
-    def test_returns_empty_on_exception(self):
+    def test_returns_static_fallback_on_all_exceptions(self):
+        """v2.6.2: 全部行业接口失败时回退到静态兜底（非空），不再返回空集合。"""
+        from magic_formula import _STATIC_FINANCIAL_CODES
         with patch("magic_formula.ak.stock_board_industry_cons_em", side_effect=RuntimeError("net")):
             codes = fetch_financial_codes_a()
-        assert len(codes) == 0
+        assert codes == _STATIC_FINANCIAL_CODES
+        assert len(codes) >= 30
 
     def test_zero_pads_short_codes(self):
         fake_df = pd.DataFrame({"代码": ["1", "600036"]})
@@ -588,3 +591,100 @@ class TestScanMagicFormula:
             assert calls[-1][0] == pytest.approx(1.0)
         finally:
             mf.CACHE_PATH = orig_path
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v2.6.2 代理免疫力测试
+# ─────────────────────────────────────────────────────────────────────────────
+
+from unittest.mock import MagicMock, call, patch as _patch
+
+import requests as _requests
+from requests.exceptions import ProxyError as _ProxyError
+
+from magic_formula import (
+    _proxy_resilient_get,
+    _STATIC_FINANCIAL_CODES,
+    fetch_financial_codes_a,
+)
+
+
+class TestProxyResilientGet:
+    """验证 _proxy_resilient_get 的重试与直连切换逻辑。"""
+
+    def test_succeeds_on_first_attempt(self):
+        """首次请求成功时直接返回，无重试。"""
+        mock_resp = MagicMock(status_code=200)
+        with _patch("magic_formula.requests.get", return_value=mock_resp) as mock_get:
+            resp = _proxy_resilient_get("http://example.com/data")
+        assert resp.status_code == 200
+        assert mock_get.call_count == 1
+
+    def test_retries_on_proxy_error_then_succeeds(self):
+        """首次 ProxyError，第二次成功（切直连）。"""
+        mock_resp = MagicMock(status_code=200)
+        with _patch(
+            "magic_formula.requests.get",
+            side_effect=[_ProxyError("proxy down"), mock_resp],
+        ) as mock_get:
+            resp = _proxy_resilient_get("http://example.com/data")
+        assert resp.status_code == 200
+        assert mock_get.call_count == 2
+        # 第二次调用应强制直连（proxies={'http': None, 'https': None}）
+        second_call_kwargs = mock_get.call_args_list[1][1]
+        assert second_call_kwargs.get("proxies") == {"http": None, "https": None}
+
+    def test_raises_after_all_retries_exhausted(self):
+        """所有重试耗尽后，向上抛出最后一次异常。"""
+        with _patch(
+            "magic_formula.requests.get",
+            side_effect=_ProxyError("persistent proxy error"),
+        ):
+            import pytest as _pytest
+            with _pytest.raises(_ProxyError):
+                _proxy_resilient_get("http://example.com/data")
+
+    def test_timeout_set_to_five_seconds(self):
+        """默认超时必须是 5 秒。"""
+        mock_resp = MagicMock(status_code=200)
+        with _patch("magic_formula.requests.get", return_value=mock_resp) as mock_get:
+            _proxy_resilient_get("http://example.com/data")
+        call_kwargs = mock_get.call_args[1]
+        assert call_kwargs.get("timeout") == 5
+
+
+class TestFinancialCodesStaticFallback:
+    """验证黑名单网络全失败时回退到静态兜底。"""
+
+    def test_static_fallback_when_all_boards_fail(self):
+        """所有行业接口失败时，返回静态兜底集合。"""
+        import akshare as ak
+        with _patch.object(
+            ak, "stock_board_industry_cons_em", side_effect=Exception("proxy error")
+        ):
+            result = fetch_financial_codes_a()
+        # 应回退到静态集合（非空）
+        assert result == _STATIC_FINANCIAL_CODES
+        assert len(result) >= 30
+
+    def test_partial_success_uses_network_data(self):
+        """部分行业成功时，使用网络获取的数据（不回退静态）。"""
+        import pandas as pd
+        import akshare as ak
+        mock_df = pd.DataFrame({"代码": ["600036", "601166"]})
+
+        call_count = [0]
+
+        def side_effect(symbol):
+            call_count[0] += 1
+            if symbol == "银行":
+                return mock_df
+            raise Exception("proxy error")
+
+        with _patch.object(ak, "stock_board_industry_cons_em", side_effect=side_effect):
+            result = fetch_financial_codes_a()
+
+        # 有部分成功 → 返回网络数据，不是静态兜底
+        assert result != _STATIC_FINANCIAL_CODES
+        assert "600036" in result

@@ -11,6 +11,7 @@ magic_formula.py — 格林布拉特"神奇公式"全市场扫描器 v2.5
 import json
 import logging
 import os
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -19,6 +20,8 @@ from typing import Optional
 
 import akshare as ak
 import pandas as pd
+import requests
+from requests.exceptions import ProxyError, ConnectionError as ReqConnectionError
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +31,85 @@ CACHE_MAX_HOURS = 18
 TOP_N_DEFAULT = 30
 MAX_WORKERS = 8
 _FETCH_DELAY = 0.15  # seconds per worker between calls
+_FETCH_TIMEOUT = 5   # 硬超时：5 秒，与 crawler.py 保持一致
+
+# 随机 User-Agent 池（同 crawler.py），防止代理因固定 UA 拒绝连接
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
+]
+
+_PROXY_RETRY_LIMIT = 3  # ProxyError 最大重试次数
+
+
+def _random_headers(extra: Optional[dict] = None) -> dict:
+    """生成含随机 UA、Connection:close 的请求头（同 crawler.py）。"""
+    headers = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Connection": "close",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _proxy_resilient_get(url: str, **kwargs) -> requests.Response:
+    """
+    带代理免疫力的 GET 请求：
+    - 随机 UA + Connection:close
+    - 5 秒硬超时
+    - ProxyError / ConnectionError 自动重试 3 次
+    - 第 2 次起强制直连（proxies={'http': None, 'https': None}）
+    """
+    kwargs.setdefault("timeout", _FETCH_TIMEOUT)
+    kwargs.setdefault("headers", _random_headers())
+
+    last_exc: Exception = RuntimeError("no attempt")
+    for attempt in range(_PROXY_RETRY_LIMIT):
+        try:
+            if attempt >= 1:
+                # 强制直连，绕过系统代理
+                kwargs["proxies"] = {"http": None, "https": None}
+                kwargs["headers"] = _random_headers()  # 换 UA
+            return requests.get(url, **kwargs)
+        except (ProxyError, ReqConnectionError) as exc:
+            last_exc = exc
+            logger.warning(
+                "请求失败（第 %d/%d 次）[%s]: %s",
+                attempt + 1, _PROXY_RETRY_LIMIT, url[:80], exc,
+            )
+            time.sleep(0.5 * (attempt + 1))
+    raise last_exc
 
 # 金融行业关键词（剔除）
 _FINANCIAL_KEYWORDS: frozenset[str] = frozenset({
     "银行", "保险", "证券", "信托", "多元金融", "期货", "租赁",
+})
+
+# 静态金融股代码兜底（常见大市值，网络失败时使用）
+# 覆盖四大行、股份行、城商行、保险、券商等，约 60 只核心金融股
+_STATIC_FINANCIAL_CODES: frozenset[str] = frozenset({
+    # 国有大行
+    "601398", "601939", "601288", "601988", "601328",
+    # 股份制银行
+    "600036", "601166", "600016", "601169", "600000", "601998", "600015",
+    "601009", "601229", "601577",
+    # 城商行
+    "601838", "601963", "601128", "601077", "601187", "601216",
+    # 保险
+    "601336", "601601", "601628", "601318", "600061",
+    # 证券
+    "600030", "601688", "601995", "600999", "601211", "601878",
+    "600837", "601375", "601198", "601901",
+    # 信托/多元金融
+    "600816", "601099", "600818", "601139",
 })
 
 # 资产负债表科目候选名称（兼容不同数据源版本）
@@ -207,10 +285,13 @@ def _extract_value(df: pd.DataFrame, candidates: list[str]) -> Optional[float]:
 def fetch_financial_codes_a() -> frozenset[str]:
     """
     获取 A 股金融类行业成分股代码集合（银行/保险/证券/多元金融），用于剔除。
-    任何单个行业获取失败时静默忽略，返回已获取的部分集合。
+    - 任何单个行业获取失败时静默忽略，返回已获取的部分集合。
+    - 若全部行业均获取失败（网络/代理故障），回退到本地硬编码的
+      _STATIC_FINANCIAL_CODES，确保扫描流程不中断。
     """
     financial_boards = ["银行", "保险", "证券", "多元金融"]
     codes: set[str] = set()
+    failures = 0
     for board in financial_boards:
         try:
             df = ak.stock_board_industry_cons_em(symbol=board)
@@ -219,8 +300,19 @@ def fetch_financial_codes_a() -> frozenset[str]:
                 if code_col:
                     codes.update(df[code_col].astype(str).str.zfill(6).tolist())
         except Exception as exc:
+            failures += 1
             logger.warning("获取金融行业成分股失败 [%s]: %s", board, exc)
-    logger.info("金融类黑名单: %d 只", len(codes))
+
+    if failures == len(financial_boards):
+        # 全部失败 → 回退静态兜底，保障扫描不中断
+        logger.warning(
+            "金融黑名单网络全部失败，回退本地静态黑名单（%d 只）",
+            len(_STATIC_FINANCIAL_CODES),
+        )
+        return _STATIC_FINANCIAL_CODES
+
+    logger.info("金融类黑名单: %d 只（网络获取 %d 只，%d 个行业失败）",
+                len(codes), len(codes), failures)
     return frozenset(codes)
 
 

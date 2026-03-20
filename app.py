@@ -1239,16 +1239,29 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
     with col_btn:
         do_scan = st.button("🔄 重新扫描全市场", use_container_width=True)
 
+    # ── 显示上次扫描进度（页面刷新后恢复）
+    _last_pct = st.session_state.get("_scan_progress_pct", 0.0)
+    _last_msg = st.session_state.get("_scan_progress_msg", "")
+    if 0 < _last_pct < 1.0 and not do_scan:
+        st.progress(_last_pct, text=f"↩️ 上次扫描进度 {_last_pct:.0%}：{_last_msg}（点击重新扫描继续）")
+
     # ── 执行扫描
     if do_scan:
+        # 重置断点
+        st.session_state["_scan_progress_pct"] = 0.0
+        st.session_state["_scan_progress_msg"] = ""
         progress_bar = st.progress(0.0, text="准备开始扫描…")
 
         def _cb(pct: float, msg: str) -> None:
             progress_bar.progress(min(pct, 1.0), text=msg)
+            # 持久化进度到 session_state，页面刷新后可恢复
+            st.session_state["_scan_progress_pct"] = pct
+            st.session_state["_scan_progress_msg"] = msg
 
         with st.spinner("神奇公式全市场扫描中，请耐心等待…"):
             try:
                 cache = scan_magic_formula(top_n=30, include_h=True, progress_callback=_cb)
+                st.session_state["_scan_progress_pct"] = 1.0
                 st.success("✅ 扫描完成！")
                 st.rerun()
             except Exception as exc:
