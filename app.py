@@ -625,11 +625,21 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         # ── v2.4 总仓位摘要卡片（同花顺风格）
         ps = engine.position_summary
         with st.container():
+            _roe_alert_inline = ""
+            if roe_info and roe_info.get("consecutive_decline", 0) >= 3:
+                _roe_tip = roe_info.get("alert", "")
+                _roe_alert_inline = (
+                    ' <span style="display:inline-block;background:#FEE2E2;color:#DC2626;'
+                    'border:1px solid #FCA5A5;border-radius:4px;font-size:0.7rem;'
+                    'font-weight:700;padding:1px 6px;vertical-align:middle;" '
+                    f'title="{_roe_tip}">⚠️ ROE衰减</span>'
+                )
             st.markdown(
                 f'<span class="lv-badge">{code}.HK</span>'
                 f' <span style="font-size:1.15rem;font-weight:800;color:#111827;">{name}</span>'
-                f'<span style="font-size:0.72rem;color:#9CA3AF;margin-left:10px;">'
-                f'Step {engine.step:.3f} · {engine.grid_levels} 格</span>',
+                + _roe_alert_inline
+                + f'<span style="font-size:0.72rem;color:#9CA3AF;margin-left:10px;">'
+                + f'Step {engine.step:.3f} · {engine.grid_levels} 格</span>',
                 unsafe_allow_html=True,
             )
 
@@ -1397,7 +1407,9 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
                 # v2.6.1 DCF 估算（实时，允许失败）
                 _dcf = compute_dcf_value(stock.code)
                 _dcf_line = (
-                    f"估算内在价值 (DCF)：{_dcf['dcf_total']:.1f} 亿（基于近{_dcf['years']}年经营现金流均值 {_dcf['cf_avg']:.1f} 亿，{_dcf['note']}）"
+                    f"估算内在价值 (DCF)：{_dcf['dcf_total']:.1f} 亿"
+                    f"（折现率 10%，永续增长率 5%，公式 V=CF×(1+g)/(k-g)；"
+                    f"基于近{_dcf['years']}年经营现金流均值 {_dcf['cf_avg']:.1f} 亿，{_dcf['note']}）"
                     if _dcf else "估算内在价值 (DCF)：暂无现金流数据"
                 )
                 summary = (

@@ -985,3 +985,33 @@ class TestCheckNetworkConnectivityDirectFirst:
         result = check_network_connectivity()
         assert result is True
         assert magic_formula._DIRECT_CONNECT_PREFERRED is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestProxyIsolationWithEnvProxy (v2.6.7 回归)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProxyIsolationWithEnvProxy:
+    """验证即使环境变量设有 HTTP_PROXY，东财/新浪域名依然走显式直连（出淤泥而不染）。"""
+
+    def test_eastmoney_always_direct_even_with_http_proxy_env(self, monkeypatch):
+        """设置 HTTP_PROXY 后，eastmoney.com 的 _get_proxies_for_url 仍返回显式直连。"""
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.example.com:8080")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp.example.com:8080")
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", False)
+
+        result = _get_proxies_for_url("https://push2.eastmoney.com/api/query")
+        # 无论 HTTP_PROXY 如何，域名白名单命中 → 必须返回显式直连
+        assert result == {"http": None, "https": None}, (
+            f"eastmoney.com 应走直连，但 _get_proxies_for_url 返回 {result!r}"
+        )
+
+    def test_sinajs_always_direct_even_with_http_proxy_env(self, monkeypatch):
+        """设置 HTTP_PROXY 后，sinajs.cn 的 _get_proxies_for_url 仍返回显式直连。"""
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.example.com:3128")
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", False)
+
+        result = _get_proxies_for_url("https://hq.sinajs.cn/list=sh600036")
+        assert result == {"http": None, "https": None}, (
+            f"sinajs.cn 应走直连，但 _get_proxies_for_url 返回 {result!r}"
+        )
