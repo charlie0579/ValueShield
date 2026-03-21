@@ -66,6 +66,17 @@ _PROXY_ENV_KEYS = (
     "ALL_PROXY", "all_proxy",
 )
 
+# 直连优先标志：种子预热成功后由 check_network_connectivity() 设置
+# True = 本次扫描全程强制直连，绕过所有代理环境变量
+_DIRECT_CONNECT_PREFERRED: bool = False
+
+# 域名白名单：这些域名的请求一律走直连（金融接口对代理 IP 敏感）
+_DIRECT_CONNECT_DOMAINS: tuple[str, ...] = (
+    ".eastmoney.com",
+    ".sinajs.cn",
+    ".sina.com.cn",
+)
+
 
 def _build_session() -> requests.Session:
     """构建带指数退避重试的持久化 Session（避免每次请求重建 TCP 连接）。"""
@@ -124,6 +135,22 @@ def _random_headers(extra: Optional[dict] = None) -> dict:
     return headers
 
 
+def _is_direct_connect_domain(url: str) -> bool:
+    """判断 URL 是否属于强制直连域名白名单（金融接口敏感，代理反而阻断）。"""
+    return any(domain in url for domain in _DIRECT_CONNECT_DOMAINS)
+
+
+def _get_proxies_for_url(url: str) -> Optional[dict]:
+    """根据当前直连策略和域名白名单，返回应传给 requests 的 proxies 参数。
+    - 域名白名单命中 → 显式直连
+    - 全局直连优先标志开启 → 显式直连
+    - 否则 → None（由 Session/环境变量决定）
+    """
+    if _is_direct_connect_domain(url) or _DIRECT_CONNECT_PREFERRED:
+        return {"http": None, "https": None}
+    return None
+
+
 def _proxy_resilient_get(url: str, **kwargs) -> requests.Response:
     """
     带代理免疫力的 GET 请求：
@@ -136,6 +163,11 @@ def _proxy_resilient_get(url: str, **kwargs) -> requests.Response:
     kwargs.setdefault("headers", _random_headers())
 
     last_exc: Exception = RuntimeError("no attempt")
+    # 首次请求前：注入域名白名单或全局直连策略
+    if "proxies" not in kwargs:
+        route = _get_proxies_for_url(url)
+        if route is not None:
+            kwargs["proxies"] = route
     for attempt in range(_PROXY_RETRY_LIMIT):
         try:
             if attempt >= 1:
@@ -154,29 +186,34 @@ def _proxy_resilient_get(url: str, **kwargs) -> requests.Response:
 
 def check_network_connectivity() -> bool:
     """
-    种子预热：尝试访问百度确认基本网络可达。
-    先走当前代理配置，若失败则强制直连再试一次。
-    两次均失败才返回 False，提示用户检查 Linux 代理连通性。
+    种子预热（直连优先策略）：
+    1. 先尝试强制直连（proxies={http:None, https:None}）
+    2. 直连成功 → 设置全局 _DIRECT_CONNECT_PREFERRED=True，本次扫描全程直连
+    3. 直连失败 → 尝试当前系统代理
+    4. 两者均失败 → 返回 False
     """
-    for proxies in (None, {"http": None, "https": None}):
+    global _DIRECT_CONNECT_PREFERRED
+    # 直连优先：先试直连，成功则本次扫描全程强制直连
+    for proxies in ({"http": None, "https": None}, None):
         try:
             kwargs: dict = dict(
                 timeout=_SEED_TIMEOUT,
                 headers=_random_headers(),
                 allow_redirects=True,
+                proxies=proxies,
             )
-            if proxies is not None:
-                kwargs["proxies"] = proxies
             resp = _SESSION.get(_SEED_URL, **kwargs)
             if resp.status_code < 500:
+                is_direct = proxies is not None and proxies.get("http") is None
+                _DIRECT_CONNECT_PREFERRED = is_direct
                 logger.info(
-                    "种子预热成功（proxies=%s，status=%s）",
-                    proxies, resp.status_code,
+                    "种子预热成功（proxies=%s，直连优先=%s，status=%s）",
+                    proxies, _DIRECT_CONNECT_PREFERRED, resp.status_code,
                 )
                 return True
         except Exception as exc:
             logger.warning("种子预热失败（proxies=%s）: %s", proxies, exc)
-    logger.error("种子预热：有代理和直连均失败，Linux 网络不可用")
+    logger.error("种子预热：直连和代理均失败，Linux 网络不可用")
     return False
 
 

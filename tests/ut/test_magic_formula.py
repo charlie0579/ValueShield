@@ -35,7 +35,11 @@ from magic_formula import (
     rank_and_select,
     save_cache,
     scan_magic_formula,
+    _is_direct_connect_domain,
+    _get_proxies_for_url,
+    check_network_connectivity,
 )
+import magic_formula as _mf_module
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -906,3 +910,78 @@ class TestNetworkGating:
         assert result.get("error") == "network_unavailable"
         assert result["universe_size"] == 0
         assert result["top_stocks"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestDirectConnectDomains
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDirectConnectDomains:
+    """验证域名白名单判断与 proxies 路由逻辑。"""
+
+    def test_eastmoney_domain_is_direct(self):
+        """eastmoney.com 域名应命中直连白名单。"""
+        assert _is_direct_connect_domain("https://push2.eastmoney.com/api/data") is True
+
+    def test_sinajs_domain_is_direct(self):
+        """sinajs.cn 域名应命中直连白名单。"""
+        assert _is_direct_connect_domain("https://hq.sinajs.cn/list=sh600036") is True
+
+    def test_non_whitelisted_domain_is_not_direct(self):
+        """普通域名不应命中直连白名单。"""
+        assert _is_direct_connect_domain("https://www.baidu.com") is False
+
+    def test_get_proxies_for_whitelist_url_returns_direct(self, monkeypatch):
+        """域名白名单命中时，_get_proxies_for_url 应返回显式直连 proxies。"""
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", False)
+        result = _get_proxies_for_url("https://push2.eastmoney.com/api/query")
+        assert result == {"http": None, "https": None}
+
+    def test_get_proxies_with_direct_flag_returns_direct(self, monkeypatch):
+        """全局直连标志开启时，任意 URL 都应返回显式直连 proxies。"""
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", True)
+        result = _get_proxies_for_url("https://www.google.com")
+        assert result == {"http": None, "https": None}
+
+    def test_get_proxies_no_flag_no_whitelist_returns_none(self, monkeypatch):
+        """标志关闭且非白名单域名时，_get_proxies_for_url 应返回 None。"""
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", False)
+        result = _get_proxies_for_url("https://www.baidu.com")
+        assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestCheckNetworkConnectivityDirectFirst
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCheckNetworkConnectivityDirectFirst:
+    """验证 check_network_connectivity 直连优先策略与 _DIRECT_CONNECT_PREFERRED 设置。"""
+
+    def test_sets_direct_preferred_when_direct_connect_succeeds(self, monkeypatch):
+        """直连成功时应设置 _DIRECT_CONNECT_PREFERRED = True。"""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        monkeypatch.setattr(magic_formula._SESSION, "get", MagicMock(return_value=mock_resp))
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", False)
+        result = check_network_connectivity()
+        assert result is True
+        assert magic_formula._DIRECT_CONNECT_PREFERRED is True
+
+    def test_does_not_set_direct_preferred_when_only_proxy_succeeds(self, monkeypatch):
+        """仅代理成功（直连失败）时，_DIRECT_CONNECT_PREFERRED 应保持 False。"""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            # 第一次（直连）失败，第二次（代理）成功
+            if call_count["n"] == 1:
+                raise Exception("direct connect failed")
+            return mock_resp
+
+        monkeypatch.setattr(magic_formula._SESSION, "get", side_effect)
+        monkeypatch.setattr(magic_formula, "_DIRECT_CONNECT_PREFERRED", False)
+        result = check_network_connectivity()
+        assert result is True
+        assert magic_formula._DIRECT_CONNECT_PREFERRED is False

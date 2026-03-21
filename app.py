@@ -1265,7 +1265,7 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
                     st.error(
                         "🚫 网络环境不可用，请检查 Linux 代理连通性\n\n"
                         "**解决方法：**\n"
-                        "- 检查系统代理（HTTP\_PROXY / HTTPS\_PROXY）是否已断线\n"
+                        "- 检查系统代理（HTTP_PROXY / HTTPS_PROXY）是否已断线\n"
                         "- 取消代理后重试：`unset HTTP_PROXY HTTPS_PROXY`\n"
                         "- 或在有效代理环境下重新扫描"
                     )
