@@ -1261,6 +1261,15 @@ def _render_magic_formula_tab(config: dict, state: dict) -> None:
         with st.spinner("神奇公式全市场扫描中，请耐心等待…"):
             try:
                 cache = scan_magic_formula(top_n=30, include_h=True, progress_callback=_cb)
+                if cache.get("error") == "network_unavailable":
+                    st.error(
+                        "🚫 网络环境不可用，请检查 Linux 代理连通性\n\n"
+                        "**解决方法：**\n"
+                        "- 检查系统代理（HTTP\_PROXY / HTTPS\_PROXY）是否已断线\n"
+                        "- 取消代理后重试：`unset HTTP_PROXY HTTPS_PROXY`\n"
+                        "- 或在有效代理环境下重新扫描"
+                    )
+                    return
                 st.session_state["_scan_progress_pct"] = 1.0
                 st.success("✅ 扫描完成！")
                 st.rerun()

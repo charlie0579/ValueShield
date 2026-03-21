@@ -22,7 +22,9 @@ from typing import Optional
 import akshare as ak
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 from requests.exceptions import ProxyError, ConnectionError as ReqConnectionError
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ CACHE_PATH = os.path.join(_HERE, "magic_formula_cache.json")
 CACHE_MAX_HOURS = 18
 TOP_N_DEFAULT = 30
 MAX_WORKERS = 8
-_FETCH_DELAY = 0.15  # seconds per worker between calls
+_FETCH_DELAY = 1.5   # seconds per worker between calls (WAF 降频保护)
 _FETCH_TIMEOUT = 5   # 硬超时：5 秒，与 crawler.py 保持一致
 
 # 随机 User-Agent 池（同 crawler.py），防止代理因固定 UA 拒绝连接
@@ -47,11 +49,41 @@ _USER_AGENTS = [
 
 _PROXY_RETRY_LIMIT = 3  # ProxyError 最大重试次数
 
+# 东财域名级别 Headers（伪装真实浏览器，降低 WAF 命中率）
+_EASTMONEY_HEADERS: dict[str, str] = {
+    "Referer": "https://www.eastmoney.com/",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept": "application/json, text/plain, */*",
+}
+
+# 种子预热 URL 与超时
+_SEED_URL = "https://www.baidu.com"
+_SEED_TIMEOUT = 6  # 秒
+
 # 代理环境变量键名（清除时使用）
 _PROXY_ENV_KEYS = (
     "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
     "ALL_PROXY", "all_proxy",
 )
+
+
+def _build_session() -> requests.Session:
+    """构建带指数退避重试的持久化 Session（避免每次请求重建 TCP 连接）。"""
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+_SESSION: requests.Session = _build_session()
 
 
 @contextlib.contextmanager
@@ -79,12 +111,13 @@ def _no_proxy_ctx():
 
 
 def _random_headers(extra: Optional[dict] = None) -> dict:
-    """生成含随机 UA、Connection:close 的请求头（同 crawler.py）。"""
+    """生成含随机 UA、东财 Referer 的请求头（伪装真实浏览器，降低 WAF 命中率）。"""
     headers = {
         "User-Agent": random.choice(_USER_AGENTS),
-        "Connection": "close",
+        "Connection": "keep-alive",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        **_EASTMONEY_HEADERS,
     }
     if extra:
         headers.update(extra)
@@ -109,7 +142,7 @@ def _proxy_resilient_get(url: str, **kwargs) -> requests.Response:
                 # 强制直连，绕过系统代理
                 kwargs["proxies"] = {"http": None, "https": None}
                 kwargs["headers"] = _random_headers()  # 换 UA
-            return requests.get(url, **kwargs)
+            return _SESSION.get(url, **kwargs)
         except (ProxyError, ReqConnectionError) as exc:
             last_exc = exc
             logger.warning(
@@ -118,6 +151,34 @@ def _proxy_resilient_get(url: str, **kwargs) -> requests.Response:
             )
             time.sleep(0.5 * (attempt + 1))
     raise last_exc
+
+def check_network_connectivity() -> bool:
+    """
+    种子预热：尝试访问百度确认基本网络可达。
+    先走当前代理配置，若失败则强制直连再试一次。
+    两次均失败才返回 False，提示用户检查 Linux 代理连通性。
+    """
+    for proxies in (None, {"http": None, "https": None}):
+        try:
+            kwargs: dict = dict(
+                timeout=_SEED_TIMEOUT,
+                headers=_random_headers(),
+                allow_redirects=True,
+            )
+            if proxies is not None:
+                kwargs["proxies"] = proxies
+            resp = _SESSION.get(_SEED_URL, **kwargs)
+            if resp.status_code < 500:
+                logger.info(
+                    "种子预热成功（proxies=%s，status=%s）",
+                    proxies, resp.status_code,
+                )
+                return True
+        except Exception as exc:
+            logger.warning("种子预热失败（proxies=%s）: %s", proxies, exc)
+    logger.error("种子预热：有代理和直连均失败，Linux 网络不可用")
+    return False
+
 
 # 金融行业关键词（剔除）
 _FINANCIAL_KEYWORDS: frozenset[str] = frozenset({
@@ -726,14 +787,17 @@ def scan_magic_formula(
         # Step 1: 构建股票宇宙
         _progress(0.02, "获取金融行业黑名单…")
         financial_codes = fetch_financial_codes_a()
+        time.sleep(1.5)  # WAF 降频：黑名单请求与 A 股宇宙之间
 
         _progress(0.05, "获取 A 股宇宙…")
         universe_a = fetch_universe_a(financial_codes)
+        time.sleep(1.5)  # WAF 降频：A 股宇宙与 H 股宇宙之间
 
         universe_h: list[dict] = []
         if include_h:
             _progress(0.09, "获取 H 股宇宙…")
             universe_h = fetch_universe_h()
+            time.sleep(1.5)  # WAF 降频：H 股宇宙与 AH 溢价之间
 
         universe = universe_a + universe_h
         total = len(universe)
@@ -780,6 +844,17 @@ def scan_magic_formula(
             "top_stocks": [s.to_dict() for s in top_stocks],
             "scanned_count": len(valid_scores),
             "universe_size": total,
+        }
+
+    # 种子预热：确认基本网络连通性
+    _progress(0.01, "检查网络连通性…")
+    if not check_network_connectivity():
+        logger.error("种子预热失败，Linux 网络/代理环境不可用")
+        return {
+            "top_stocks": [],
+            "scanned_count": 0,
+            "universe_size": 0,
+            "error": "network_unavailable",
         }
 
     # 第一次：尊重当前环境代理配置（有代理走代理，无代理直连）

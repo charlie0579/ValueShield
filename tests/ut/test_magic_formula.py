@@ -13,6 +13,9 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+import requests
+
+import magic_formula
 from magic_formula import (
     CACHE_MAX_HOURS,
     StockScore,
@@ -668,45 +671,43 @@ from magic_formula import (
 
 
 class TestProxyResilientGet:
-    """验证 _proxy_resilient_get 的重试与直连切换逻辑。"""
+    """验证 _proxy_resilient_get 的重试与直连切换逻辑（使用 _SESSION.get）。"""
 
-    def test_succeeds_on_first_attempt(self):
+    def test_succeeds_on_first_attempt(self, monkeypatch):
         """首次请求成功时直接返回，无重试。"""
         mock_resp = MagicMock(status_code=200)
-        with _patch("magic_formula.requests.get", return_value=mock_resp) as mock_get:
-            resp = _proxy_resilient_get("http://example.com/data")
+        mock_get = MagicMock(return_value=mock_resp)
+        monkeypatch.setattr(magic_formula._SESSION, "get", mock_get)
+        resp = _proxy_resilient_get("http://example.com/data")
         assert resp.status_code == 200
         assert mock_get.call_count == 1
 
-    def test_retries_on_proxy_error_then_succeeds(self):
+    def test_retries_on_proxy_error_then_succeeds(self, monkeypatch):
         """首次 ProxyError，第二次成功（切直连）。"""
         mock_resp = MagicMock(status_code=200)
-        with _patch(
-            "magic_formula.requests.get",
-            side_effect=[_ProxyError("proxy down"), mock_resp],
-        ) as mock_get:
-            resp = _proxy_resilient_get("http://example.com/data")
+        mock_get = MagicMock(side_effect=[_ProxyError("proxy down"), mock_resp])
+        monkeypatch.setattr(magic_formula._SESSION, "get", mock_get)
+        resp = _proxy_resilient_get("http://example.com/data")
         assert resp.status_code == 200
         assert mock_get.call_count == 2
         # 第二次调用应强制直连（proxies={'http': None, 'https': None}）
         second_call_kwargs = mock_get.call_args_list[1][1]
         assert second_call_kwargs.get("proxies") == {"http": None, "https": None}
 
-    def test_raises_after_all_retries_exhausted(self):
+    def test_raises_after_all_retries_exhausted(self, monkeypatch):
         """所有重试耗尽后，向上抛出最后一次异常。"""
-        with _patch(
-            "magic_formula.requests.get",
-            side_effect=_ProxyError("persistent proxy error"),
-        ):
-            import pytest as _pytest
-            with _pytest.raises(_ProxyError):
-                _proxy_resilient_get("http://example.com/data")
+        mock_get = MagicMock(side_effect=_ProxyError("persistent proxy error"))
+        monkeypatch.setattr(magic_formula._SESSION, "get", mock_get)
+        import pytest as _pytest
+        with _pytest.raises(_ProxyError):
+            _proxy_resilient_get("http://example.com/data")
 
-    def test_timeout_set_to_five_seconds(self):
+    def test_timeout_set_to_five_seconds(self, monkeypatch):
         """默认超时必须是 5 秒。"""
         mock_resp = MagicMock(status_code=200)
-        with _patch("magic_formula.requests.get", return_value=mock_resp) as mock_get:
-            _proxy_resilient_get("http://example.com/data")
+        mock_get = MagicMock(return_value=mock_resp)
+        monkeypatch.setattr(magic_formula._SESSION, "get", mock_get)
+        _proxy_resilient_get("http://example.com/data")
         call_kwargs = mock_get.call_args[1]
         assert call_kwargs.get("timeout") == 5
 
@@ -807,3 +808,101 @@ class TestNoProxyCtx:
             assert "HTTPS_PROXY" not in os.environ
         # 退出后仍无代理变量（不应凭空创建）
         assert "HTTPS_PROXY" not in os.environ
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestPersistentSession
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPersistentSession:
+    """验证 _SESSION 为持久化 Session 且已配置指数退避重试 Adapter。"""
+
+    def test_session_is_requests_session(self):
+        """_SESSION 必须是 requests.Session 实例。"""
+        from requests.adapters import HTTPAdapter
+        assert isinstance(magic_formula._SESSION, requests.Session)
+
+    def test_session_has_retry_adapter_for_http(self):
+        """http:// 必须使用带重试的 HTTPAdapter，total=5。"""
+        from requests.adapters import HTTPAdapter
+        adapter = magic_formula._SESSION.get_adapter("http://example.com")
+        assert isinstance(adapter, HTTPAdapter)
+        assert adapter.max_retries.total == 5
+
+    def test_session_has_retry_adapter_for_https(self):
+        """https:// 必须使用带重试的 HTTPAdapter，total=5。"""
+        from requests.adapters import HTTPAdapter
+        adapter = magic_formula._SESSION.get_adapter("https://example.com")
+        assert isinstance(adapter, HTTPAdapter)
+        assert adapter.max_retries.total == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestCheckNetworkConnectivity
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCheckNetworkConnectivity:
+    """验证 check_network_connectivity 在各种网络状态下的行为。"""
+
+    def test_returns_true_when_seed_responds_200(self, monkeypatch):
+        """种子页面返回 200 时，应返回 True。"""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        monkeypatch.setattr(magic_formula._SESSION, "get", MagicMock(return_value=mock_resp))
+        assert magic_formula.check_network_connectivity() is True
+
+    def test_returns_false_when_all_attempts_fail(self, monkeypatch):
+        """两次尝试（代理+直连）均抛异常时，应返回 False。"""
+        monkeypatch.setattr(
+            magic_formula._SESSION,
+            "get",
+            MagicMock(side_effect=Exception("connection refused")),
+        )
+        assert magic_formula.check_network_connectivity() is False
+
+    def test_returns_true_on_direct_connect_fallback(self, monkeypatch):
+        """代理失败但直连成功时，应返回 True。"""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise Exception("proxy dead")
+            return mock_resp
+
+        monkeypatch.setattr(magic_formula._SESSION, "get", side_effect)
+        assert magic_formula.check_network_connectivity() is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestFetchDelay
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFetchDelay:
+    """验证 _FETCH_DELAY 已提升到 WAF 安全阈值（≥1.5s）。"""
+
+    def test_fetch_delay_is_throttled(self):
+        assert magic_formula._FETCH_DELAY >= 1.5, (
+            f"_FETCH_DELAY={magic_formula._FETCH_DELAY} 应 ≥ 1.5 秒（WAF 降频要求）"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestNetworkGating
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNetworkGating:
+    """验证 scan_magic_formula 在网络不可用时快速返回 error=network_unavailable。"""
+
+    def test_returns_network_unavailable_when_connectivity_fails(self, monkeypatch):
+        """网络不可通时，scan 应立即返回 error=network_unavailable，不触发扫描。"""
+        monkeypatch.setattr(
+            "magic_formula.check_network_connectivity",
+            lambda: False,
+        )
+        result = scan_magic_formula(progress_callback=None)
+        assert result.get("error") == "network_unavailable"
+        assert result["universe_size"] == 0
+        assert result["top_stocks"] == []
